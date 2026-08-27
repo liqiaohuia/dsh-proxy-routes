@@ -86,12 +86,20 @@ dsh plugin --profile web add https://github.com/<you>/dsh-proxy-routes.git
 语义化版本号（`update` 拉的是分支最新代码）、npm 搜索里找不到。
 
 **路线 B —— GitHub + npm（推荐）**：npm 提供短包名安装、版本号管理与回滚、
-npm 搜索可发现性。需要在 [npmjs.com](https://www.npmjs.com) 注册一个免费账号：
+npm 搜索可发现性。需要在 [npmjs.com](https://www.npmjs.com) 注册一个免费账号。
+
+> **重要（2026-08 实测）**：npm 现已强制要求发布前启用 2FA（否则 `npm publish`
+> 报 403 "Two-factor authentication ... is required"）。2FA 只支持 passkey
+>（验证器 App/TOTP 已下架）：Windows 上用 **Windows Hello（PIN 即可，无需
+> 指纹/USB key）**，或手机扫码存 passkey。发布时 CLI 会弹浏览器完成验证。
+> 若通行密钥弹窗只出现"USB 密钥"没有 Windows Hello：先在 Windows
+> 设置 → 帐户 → 登录选项里给账户**添加一个 PIN**（本地账户也可以，不需要
+> 微软账户），Windows Hello 选项即会出现。
 
 ```powershell
 npm login                 # 会打开浏览器完成验证
 npm pack                  # （可选）本地检查将要发布的文件清单
-npm publish               # 开了 2FA 会要求输入一次性验证码
+npm publish               # 弹浏览器 passkey 验证后发布
 ```
 
 本目录已具备发包条件（`package.json` 含 `dsh.bundle.patch` 声明、`files`
