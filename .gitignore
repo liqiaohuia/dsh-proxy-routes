@@ -1,0 +1,15 @@
+# 依赖与构建产物
+node_modules/
+
+# 本地测试残留（test-plugin.mjs / 端到端验证的工作目录）
+.test-home/
+.e2e-home/
+.git-verify/
+.pnpm-store/
+.npm-cache/
+
+# 编辑器 / 系统杂项
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

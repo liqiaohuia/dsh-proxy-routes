@@ -1,0 +1,46 @@
+{
+  "name": "dsh-proxy-routes",
+  "version": "0.1.0",
+  "description": "DSH (DeepSeek Harness) plugin: route fetch() per-domain through a SOCKS5/HTTP proxy (e.g. Anthropic via proxy) while domestic APIs (Zhipu/DeepSeek) stay direct.",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test-plugin.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "proxy",
+    "socks5",
+    "anthropic",
+    "claude",
+    "cordis"
+  ],
+  "author": "liqiaohuia",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liqiaohuia/dsh-proxy-routes.git"
+  },
+  "bugs": {
+    "url": "https://github.com/liqiaohuia/dsh-proxy-routes/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

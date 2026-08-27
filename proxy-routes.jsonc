@@ -1,0 +1,32 @@
+{
+  // ============================================================
+  // DSH 代理分流配置（插件 dsh-proxy-routes）
+  // 保存后自动热生效，无需重启 dsh。
+  // ============================================================
+  //
+  // proxy —— 代理服务器地址，支持两种协议：
+  //   "socks5://127.0.0.1:50018"  域名解析交给代理端（推荐，防 DNS 污染）
+  //   "http://127.0.0.1:7890"     HTTP CONNECT 隧道（可带认证 http://user:pass@host:port）
+  //
+  // default —— 没命中任何规则的域名走哪条路：
+  //   "direct"（直连，默认）或 "proxy"
+  //
+  // routes —— 分流规则，从上到下匹配，第一条命中生效。
+  //   domains 写域名即可自动覆盖它的所有子域名
+  //   （写 "anthropic.com" 就同时匹配 "api.anthropic.com"）
+  //   via: "proxy" 走代理 / "direct" 直连
+  //
+  // logRequests —— 控制台打印每次走代理的请求（true/false，默认 true）
+
+  "proxy": "socks5://127.0.0.1:50018",
+  "default": "direct",
+  "logRequests": true,
+
+  "routes": [
+    // Anthropic / Claude —— 需要代理
+    { "domains": ["anthropic.com", "claude.ai"], "via": "proxy" },
+
+    // 智谱 / DeepSeek —— 国内直连
+    { "domains": ["open.bigmodel.cn", "bigmodel.cn", "deepseek.com"], "via": "direct" }
+  ]
+}

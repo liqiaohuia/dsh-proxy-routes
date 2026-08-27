@@ -1,0 +1,12 @@
+# dsh-proxy-routes 的 bundle patch：把代理分流插件插入 profile 的插件树。
+# `dsh plugin --profile <name> add dsh-proxy-routes` 安装后，本文件会被
+# 自动登记为 profile 的一个 bundle 层（无需手动编辑 cordis.patch.yml）。
+#
+# 配置文件默认位于 $DSH_HOME/proxy-routes.jsonc（首次启动自动生成模板，
+# 保存即热生效）。需要自定义时，在下面给行加 config 即可：
+#   config:
+#     enabled: true                      # false = 禁用插件
+#     configFile: 'D:/anywhere/rules.jsonc'
+- insert:
+    - id: proxy-routes
+      name: 'dsh-proxy-routes'
