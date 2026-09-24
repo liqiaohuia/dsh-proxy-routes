@@ -1,29 +1,46 @@
 {
   "name": "dsh-proxy-routes",
-  "version": "0.1.0",
-  "description": "DSH (DeepSeek Harness) plugin: route fetch() per-domain through a SOCKS5/HTTP proxy (e.g. Anthropic via proxy) while domestic APIs (Zhipu/DeepSeek) stay direct.",
+  "version": "0.3.0",
+  "description": "DSH (DeepSeek Harness) plugin: per-model / per-domain proxy routing with a named proxy pool, SOCKS5/HTTP(S) via DSH's bundled undici, configurable live from the DSH settings page.",
   "type": "module",
   "main": "index.mjs",
   "exports": {
     ".": "./index.mjs",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "index.mjs",
+    "transport.mjs",
+    "catalog.mjs",
+    "lib/client.js",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
+    "build": "node scripts/build-client.mjs",
     "test": "node test-plugin.mjs"
+  },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "@types/react": "~18.3.1",
+    "esbuild": "^0.27.3",
+    "react": "^18.2.0",
+    "typescript": "~5.7.2",
+    "undici": "^8.10.0"
   },
   "keywords": [
     "dsh",
+    "dsh-plugin",
     "deepseek-harness",
     "proxy",
     "socks5",
+    "proxy-pool",
     "anthropic",
     "claude",
+    "per-model",
     "cordis"
   ],
   "author": "liqiaohuia",
@@ -41,6 +58,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "slots",
+        "locale"
+      ],
+      "platform": "web"
     }
   }
 }

@@ -1,30 +1,43 @@
 {
   // ============================================================
-  // DSH 代理分流配置（插件 dsh-proxy-routes）
+  // DSH 代理分流配置（插件 dsh-proxy-routes v0.3）
   // 保存后自动热生效，无需重启 dsh。
+  //
+  // v0.3 起也可不写本文件，直接在 DSH 设置页图形化配置
+  // （设置 → 插件 → 代理路由）；本文件存在时优先于设置页。
   // ============================================================
   //
-  // proxy —— 代理服务器地址，支持两种协议：
-  //   "socks5://127.0.0.1:50018"  域名解析交给代理端（推荐，防 DNS 污染）
-  //   "http://127.0.0.1:7890"     HTTP CONNECT 隧道（可带认证 http://user:pass@host:port）
+  // proxies —— 命名代理池（v0.3）：给每个代理起名，规则按名字引用。
+  //   支持三种协议（等号右边可带认证 user:pass@host:port）：
+  //   "socks5://127.0.0.1:50939"   域名解析交给代理端（等效 socks5h，防 DNS 污染）
+  //   "http://127.0.0.1:7890"      HTTP CONNECT 隧道
+  //   "https://127.0.0.1:7890"     代理端 TLS（由 DSH 自带 undici 原生支持）
   //
-  // default —— 没命中任何规则的域名走哪条路：
-  //   "direct"（直连，默认）或 "proxy"
+  // proxy —— 单代理（v0.2 兼容），等价于池里名为 "default" 的一项
   //
-  // routes —— 分流规则，从上到下匹配，第一条命中生效。
-  //   domains 写域名即可自动覆盖它的所有子域名
-  //   （写 "anthropic.com" 就同时匹配 "api.anthropic.com"）
-  //   via: "proxy" 走代理 / "direct" 直连
+  // default —— 没命中任何规则的域名走哪条路："direct" / "proxy" / 代理名
+  //
+  // routes —— 按域名分流，从上到下匹配，第一条命中生效。
+  //   domains 写域名自动覆盖子域名（写 "anthropic.com" 即匹配 "api.anthropic.com"）
+  //
+  // modelRoutes —— 按模型设置（v0.3）："providerId/modelId" → 代理名 / "direct"。
+  //   按该模型 provider 的 API 域名生效：同一域名下的模型共享同一路由。
+  //   例（settings.yaml 里有 llm-pi-ai.providers.nvidia-01 时）：
+  //   "modelRoutes": { "nvidia-01/z-ai/glm-5.3": "main" }
   //
   // logRequests —— 控制台打印每次走代理的请求（true/false，默认 true）
 
-  "proxy": "socks5://127.0.0.1:50018",
+  "proxies": {
+    "main": "socks5://127.0.0.1:50939",
+    "backup": "socks5://127.0.0.1:50018"
+  },
+
   "default": "direct",
   "logRequests": true,
 
   "routes": [
     // Anthropic / Claude —— 需要代理
-    { "domains": ["anthropic.com", "claude.ai"], "via": "proxy" },
+    { "domains": ["anthropic.com", "claude.ai"], "via": "main" },
 
     // 智谱 / DeepSeek —— 国内直连
     { "domains": ["open.bigmodel.cn", "bigmodel.cn", "deepseek.com"], "via": "direct" }

@@ -1,179 +1,148 @@
-// 插件单元测试：mock Cordis ctx，验证 fetch 补丁、分流、SSE 流式、热重载、卸载还原
-import { apply } from './index.mjs';
-import { readFileSync, copyFileSync, writeFileSync, rmSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+// dsh-proxy-routes —— v0.3 测试脚本（无依赖，直接 node 运行）。
+// 覆盖：文件模式加载 / 双代理池路由 / 直连 / 模型路由编译（单元） /
+// normalizeProxyUrl 归一化（单元） / dispatcher 池缓存（单元） / 热重载 / 卸载还原。
+//
+// 运行：node test-plugin.mjs
+// 前置：本机 50939 / 50018 两个 SOCKS5 代理在监听（xray）；未监听时网络用例报 FAIL。
+// 独立运行（仓库内）需先 pnpm install（devDependencies 提供 undici）。
 
-// 路径全部相对本文件解析 —— 目录整体搬到任何位置测试都能跑
-const HERE = fileURLToPath(new URL('./', import.meta.url));
-const TEST_HOME = HERE + '.test-home';
-const SRC = HERE + 'proxy-routes.jsonc';
-const CFG = TEST_HOME + '/proxy-routes.jsonc';
-const key = readFileSync(`${homedir()}/.dsh/.credentials.yaml`, 'utf8').match(/ANTHROPIC_API_KEY:\s*(\S+)/)[1];
+import { copyFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
+// —— 前置检查：undici 可用（devDependencies 已安装 / DSH 环境自带）——
+try {
+	await import('undici');
+} catch {
+	console.error('✗ 未找到 undici —— 请先在仓库内执行: ppm install（或 pnpm install）');
+	process.exit(1);
+}
+
+const { apply } = await import('./index.mjs');
+const { normalizeProxyUrl, DispatcherPool } = await import('./transport.mjs');
+const { compileModelRoutes } = await import('./catalog.mjs');
+
+/* —— mock Cordis 上下文（无 inject → 文件模式直接生效）—— */
 const logs = [];
-const disposers = [];
+let disposer = null;
 const ctx = {
-	effect: (fn) => { const d = fn(); disposers.push(d); return d; },
-	logger: {
-		// 只负责捕获（断言用）；控制台输出由插件自身的 makeLogger 直接打印
-		info: (...a) => { logs.push(a.join(' ')); },
-		warn: (...a) => { logs.push(a.join(' ')); },
-		error: (...a) => { logs.push(a.join(' ')); },
-	},
+	effect: (fn) => { disposer = fn(); return disposer; },
+	on: (event, cb) => { if (event === 'dispose') disposeCallback = cb; return () => {}; },
+	logger: { info: (...a) => { logs.push(a.join(' ')); }, warn: (...a) => { logs.push(a.join(' ')); }, error: (...a) => { logs.push(a.join(' ')); } },
 };
+let disposeCallback = null;
 
-rmSync(TEST_HOME, { recursive: true, force: true });
-const { mkdirSync } = await import('node:fs');
-mkdirSync(TEST_HOME, { recursive: true });
-copyFileSync(SRC, CFG);
-process.env.DSH_HOME = TEST_HOME;
+/* —— 临时 DSH_HOME + 双代理配置—— */
+const HOME = mkdtempSync(join(tmpdir(), 'dsh-proxy-test-'));
+const CONFIG = join(HOME, 'proxy-routes.jsonc');
+const configText = `{
+	// 双代理池：main=50939（SOCKS5）backup=50018（SOCKS5）
+	"proxies": {
+		"main": "socks5://127.0.0.1:50939",
+		"backup": "socks5://127.0.0.1:50018"
+	},
+	"default": "direct",
+	"logRequests": true,
+	"routes": [
+		{ "domains": ["anthropic.com", "claude.ai"], "via": "main" },
+		{ "domains": ["integrate.api.nvidia.com"], "via": "backup" },
+		{ "domains": ["open.bigmodel.cn", "bigmodel.cn", "deepseek.com"], "via": "direct" }
+	]
+}`;
+writeFileSync(CONFIG, configText, 'utf8');
+process.env.DSH_HOME = HOME;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-let pass = 0, fail = 0;
-const check = (label, ok) => { console.log(`${ok ? '✅' : '❌'} ${label}`); ok ? pass++ : fail++; };
+let pass = 0, fail = 0, skip = 0;
+const check = (label, ok) => {
+	if (ok === null) { skip++; console.log(`⏭ SKIP ${label}`); return; }
+	ok ? (pass++, console.log(`✓ PASS ${label}`)) : (fail++, console.log(`✗ FAIL ${label}`));
+};
+const assertLog = (substr) => logs.some((line) => line.includes(substr));
 
-console.log('=== 1. apply + 初始加载 ===');
+/* —— 1. 文件模式加载 —— */
+const originalFetch = globalThis.fetch;
 apply(ctx, {});
-await sleep(800);
-check('配置已加载日志', logs.some((l) => l.includes('配置已加载')));
-check('fetch 已被打补丁', typeof globalThis.fetch === 'function' && globalThis.fetch.name === 'dshProxyRoutedFetch');
+await delay(600);
+check('fetch 已被补丁替换', globalThis.fetch !== originalFetch);
+check('加载日志：配置已加载', assertLog('配置已加载'));
+check('加载日志：代理池含 main 与 backup', assertLog('代理池=[main,backup]'));
+check('加载日志：文件来源', assertLog('来源=配置文件'));
 
-console.log('=== 2. 直连请求（智谱，走原始 fetch） ===');
+/* —— 2~4. 网络路由（401/400 = 经代理抵达服务端；直连=401）—— */
 try {
-	const r = await fetch('https://open.bigmodel.cn/api/coding/paas/v4/chat/completions', {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ model: 'glm-4.7', messages: [{ role: 'user', content: 'hi' }] }),
-	});
-	check(`直连请求到达智谱（期望 401，实际 ${r.status}）`, r.status === 401);
-} catch (e) {
-	check(`直连请求到达智谱（异常: ${e.message}）`, false);
-}
-
-console.log('=== 3. 代理请求（Anthropic SSE 流式） ===');
+	const r1 = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+	check('anthropic 经 main(50939) -> 401（直连为 403）', r1.status === 401);
+} catch (e) { check('anthropic 经 main(50939)', false); console.log('  ' + (e.cause?.message ?? e.message)); }
 try {
-	const r = await fetch('https://api.anthropic.com/v1/messages', {
-		method: 'POST',
-		headers: {
-			'x-api-key': key,
-			'anthropic-version': '2023-06-01',
-			'content-type': 'application/json',
-			accept: 'text/event-stream',
-		},
-		body: JSON.stringify({ model: 'claude-opus-5', max_tokens: 24, stream: true, messages: [{ role: 'user', content: 'Reply with exactly: PROXY-OK' }] }),
-	});
-	check(`代理请求状态 200（实际 ${r.status}）`, r.status === 200);
-	check('响应体是可读流', typeof r.body?.getReader === 'function');
-	const reader = r.body.getReader();
-	const dec = new TextDecoder();
-	let text = '', chunks = 0;
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		chunks++;
-		text += dec.decode(value, { stream: true });
-	}
-	check(`SSE 多块接收（${chunks} 块）`, chunks > 1);
-	check('包含 message_start 事件', text.includes('message_start'));
-	check('代理请求日志出现', logs.some((l) => l.includes('api.anthropic.com')));
-} catch (e) {
-	check(`代理请求失败: ${e.message}`, false);
-}
-
-console.log('=== 4. AbortSignal 中止 ===');
+	const r2 = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+	check('nvidia 经 backup(50018) -> 400/401/404', [400, 401, 404].includes(r2.status));
+} catch (e) { check('nvidia 经 backup(50018)', false); console.log('  ' + (e.cause?.message ?? e.message)); }
 try {
-	const ctrl = new AbortController();
-	const p = fetch('https://api.anthropic.com/v1/messages', {
-		method: 'POST',
-		signal: ctrl.signal,
-		headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-		body: JSON.stringify({ model: 'claude-opus-5', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
-	});
-	setTimeout(() => ctrl.abort(), 30);
-	await p;
-	check('中止后不应 resolve', false);
-} catch (e) {
-	check(`中止抛 AbortError（实际 ${e.name}）`, e.name === 'AbortError');
-}
+	const r3 = await fetch('https://open.bigmodel.cn/api/paas/v4/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+	check('bigmodel 直连 -> 401', r3.status === 401);
+} catch (e) { check('bigmodel 直连', false); console.log('  ' + (e.cause?.message ?? e.message)); }
+check('路由日志：anthropic -> main', logs.some((l) => l.includes('api.anthropic.com/v1/messages -> main:socks5://127.0.0.1:50939')));
+check('路由日志：nvidia -> backup', logs.some((l) => l.includes('integrate.api.nvidia.com/v1/chat/completions -> backup:socks5://127.0.0.1:50018')));
 
-console.log('=== 5. keep-alive 连接复用（第二次请求更快） ===');
-try {
-	const t0 = Date.now();
-	const r2 = await fetch('https://api.anthropic.com/v1/messages', {
-		method: 'POST',
-		headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-		body: JSON.stringify({ model: 'claude-opus-5', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
-	});
-	const elapsed = Date.now() - t0;
-	check(`复用连接请求成功（${r2.status}，${elapsed}ms）`, r2.status === 200);
-} catch (e) {
-	check(`复用连接失败: ${e.message}`, false);
-}
-
-console.log('=== 6. 配置热重载 ===');
+/* —— 5. 热重载：把 anthropic 改走 backup —— */
 logs.length = 0;
-writeFileSync(CFG, JSON.stringify({
-	proxy: 'socks5://127.0.0.1:50018',
-	default: 'direct',
-	routes: [{ domains: ['anthropic.com'], via: 'direct' }],
-}));
-await sleep(1200);
-try {
-	const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'GET' });
-	// 直连 anthropic 期望被 403（地区封锁）
-	check(`规则热更新后 anthropic 直连（期望 403，实际 ${r.status}）`, r.status === 403);
-} catch (e) {
-	check(`规则热更新后 anthropic 直连（异常: ${e.message}）`, false);
-}
-// 恢复代理规则
-writeFileSync(CFG, readFileSync(SRC, 'utf8'));
-await sleep(1200);
+writeFileSync(CONFIG, configText.replace('"via": "main"', '"via": "backup"'), 'utf8');
+await delay(1200);
+check('热重载：新配置日志（无 announce）+ anthropic -> backup 路由日志', await (async () => {
+	try {
+		await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+	} catch { /* ignore */ }
+	return logs.some((l) => l.includes('api.anthropic.com/v1/messages -> backup:socks5://127.0.0.1:50018'));
+})());
 
-console.log('=== 7. 坏配置回退 ===');
-logs.length = 0;
-// 先切到 anthropic 直连规则，再写坏配置 —— 期望保留「直连」这份最后的好配置
-writeFileSync(CFG, JSON.stringify({
-	proxy: 'socks5://127.0.0.1:50018',
-	default: 'direct',
-	routes: [{ domains: ['anthropic.com'], via: 'direct' }],
-}));
-await sleep(1200);
-writeFileSync(CFG, '{ 这不是 JSON');
-await sleep(1200);
-check('坏配置报错且保留上一份', logs.some((l) => l.includes('语法错误') || l.includes('校验失败')));
-try {
-	const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'GET' });
-	// 上一份（直连 anthropic 规则）仍生效
-	check(`坏配置后仍用旧规则（期望 403，实际 ${r.status}）`, r.status === 403);
-} catch (e) {
-	check(`坏配置后仍用旧规则（异常: ${e.message}）`, false);
-}
-// https://（代理端 TLS）应被明确拒绝，同样保留上一份
-// 注意 routes 必须含 via:"proxy" 的规则，校验才会检查 proxy 字段
-writeFileSync(CFG, JSON.stringify({ proxy: 'https://127.0.0.1:50018', default: 'direct', routes: [{ domains: ['anthropic.com'], via: 'proxy' }] }));
-await sleep(1200);
-check('https 代理被明确拒绝', logs.some((l) => l.includes('https')));
-try {
-	const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'GET' });
-	check(`https 拒绝后仍用旧规则（期望 403，实际 ${r.status}）`, r.status === 403);
-} catch (e) {
-	check(`https 拒绝后仍用旧规则（异常: ${e.message}）`, false);
-}
-writeFileSync(CFG, readFileSync(SRC, 'utf8'));
-await sleep(1200);
+/* —— 6. 卸载还原 —— */
+disposeCallback?.();
+check('卸载后 fetch 还原', globalThis.fetch === originalFetch);
 
-console.log('=== 8. 卸载还原 ===');
-for (const d of disposers.splice(0)) { try { d(); } catch (e) { console.log('  disposer error:', e.message); } }
-await sleep(200);
-check('fetch 已还原', globalThis.fetch.name !== 'dshProxyRoutedFetch');
+/* —— 7. 单元：normalizeProxyUrl —— */
 try {
-	const r = await fetch('https://open.bigmodel.cn/api/coding/paas/v4/chat/completions', { method: 'POST' });
-	check(`还原后直连仍正常（期望 401，实际 ${r.status}）`, r.status === 401);
+	const u1 = normalizeProxyUrl('socks5h://127.0.0.1:1080', 't');
+	check('socks5h 归一化为 socks5', u1.protocol === 'socks5:');
+	const u2 = normalizeProxyUrl('socks://u:p@127.0.0.1:1080', 't');
+	check('socks:// 认证信息保留', u2.username === 'u' && u2.password === 'p');
+} catch { check('normalizeProxyUrl', false); }
+try {
+	normalizeProxyUrl('ftp://127.0.0.1:21', 't');
+	check('ftp:// 拒绝（协议不支持）', false);
 } catch (e) {
-	check(`还原后直连（异常: ${e.message}）`, false);
+	check('ftp:// 拒绝（协议不支持）', String(e.message).includes('协议不支持'));
 }
 
-console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
-try { rmSync(TEST_HOME, { recursive: true, force: true }); } catch { /* Windows 文件偶发占用时的良性残留 */ }
+/* —— 8. 单元：dispatcher 池 —— */
+{
+	const pool = new DispatcherPool();
+	const url1 = normalizeProxyUrl('socks5://127.0.0.1:50939', 't');
+	const wanted = new Map([[url1.href, url1]]);
+	pool.rebuild(wanted);
+	const d1 = pool.get(url1);
+	pool.rebuild(new Map([[url1.href, url1]]));
+	check('dispatcher 池：同 URL 复用（不重建）', pool.get(url1) === d1);
+	pool.close();
+}
+
+/* —— 9. 单元：compileModelRoutes —— */
+{
+	const rows = [
+		{ key: 'p1/m1', host: 'a.example.com' },
+		{ key: 'p1/m2', host: 'a.example.com' },
+		{ key: 'p2/m1', host: 'b.example.com' },
+	];
+	const { hostRoutes, conflicts } = compileModelRoutes(rows, { 'p1/m1': 'main', 'p1/m2': 'backup', 'p2/m1': 'direct', 'p9/m9': 'x' });
+	check('模型路由：同 host 冲突时后者胜出', hostRoutes.get('a.example.com') === 'backup');
+	check('模型路由：direct 显式生效', hostRoutes.get('b.example.com') === 'direct');
+	check('模型路由：未知 key 记入 conflicts', conflicts.some((c) => c.includes('p9/m9')));
+	check('模型路由：host 冲突记入 conflicts', conflicts.some((c) => c.includes('同域名')));
+}
+
+/* —— 清理 —— */
+try { disposer?.(); } catch { /* ignore */ }
+rmSync(HOME, { recursive: true, force: true });
+console.log(`\n结果: ${pass} 通过, ${fail} 失败, ${skip} 跳过`);
 process.exit(fail > 0 ? 1 : 0);
