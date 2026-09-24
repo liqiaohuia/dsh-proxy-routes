@@ -15,9 +15,12 @@ Socks5ProxyAgent）。
 
 ## v0.3 新特性
 
-- **设置页卡片**：设置 → 插件 → **代理路由**——代理池增删改、按模型选代理、
-  域名规则、默认走向、每行「测试连接」按钮，保存即热生效（官方 settings 机制，
-  写入 settings.yaml 的 `proxy-routes` 命名空间）
+- **配置卡片**（双协议注册，两个桌面版代次都能找到）：
+  - **DSH Desktop 2.0.14+**：侧栏 **插件页（Plugins）→ 已装插件的配置区 / 详情** ——
+    卡片注册进官方 `plugins.item` 槽（详情页 summary 一行简介 + page 完整编辑卡）
+  - **DSH Desktop 2.0.13**：设置 → 插件 → **代理路由**（`settings.plugin.item` keyed 槽）
+  - 代理池增删改、按模型选代理、域名规则、默认走向、每行「测试连接」按钮，
+    保存即热生效（官方 settings 机制，写入 settings.yaml 的 `proxy-routes` 命名空间）
 - **代理池**：多个命名代理（`proxies`），每条规则按名字引用；SOCKS5 / HTTP
   CONNECT / 代理端 TLS（https://）三种协议混用
 - **按模型设置**：`"providerId/modelId" → 代理`；模型列表自动读取 DSH 已配置的
@@ -71,7 +74,9 @@ dsh plugin --profile web add https://github.com/<you>/dsh-proxy-routes.git
 
 ## 快速上手（设置页）
 
-1. 重启 DSH 后打开 **设置 → 插件**：插件列表出现「代理路由」，点开卡片
+1. 重启 DSH 后打开插件配置页：**2.0.14+ 在侧栏「插件」页**找到 dsh-proxy-routes
+   点开详情（配置区即完整卡片）；**2.0.13 在 设置 → 插件**：插件列表出现
+   「代理路由」，点开卡片
 2. **代理池**：给每个代理起名并填地址（例 `main` = `socks5://127.0.0.1:50939`），
    点「测试」确认可达（探测默认访问 `https://www.gstatic.com/generate_204`，
    可在「其他选项」里改）

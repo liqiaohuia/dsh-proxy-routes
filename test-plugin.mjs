@@ -163,24 +163,59 @@ try {
    报 "invalid plugin" 并在 DSH 启动页弹错（host 半边正常，极易误判）。这里
    完整模拟浏览器 ModuleLoader：执行 bundle 注册、真实 materialize factory、
    断言导出形态。react 走工作区 devDependency。 */
-{
+let registration = null;
+try {
+	const bundle = readFileSync(new URL('./lib/client.js', import.meta.url), 'utf8');
+	const queue = [];
+	globalThis.window = globalThis;
+	globalThis.__ModuleLoader__ = { mode: 'queue', pendingQueue: queue, load: (reg) => { queue.push(reg); } };
+	// 执行 bundle（只注册 factory，不运行模块体）
+	new Function(bundle)();
+	registration = queue.find((r) => r && r.id === 'dsh-proxy-routes');
+	check('client bundle：注册到 __ModuleLoader__（id=dsh-proxy-routes）', Boolean(registration));
+} catch (error) {
+	check('client bundle：注册到 __ModuleLoader__（id=dsh-proxy-routes）', false);
+	console.log('  ' + (error.code ?? '') + ' ' + String(error.message).split('\n')[0]);
+}
+
+/* —— 11. client apply 协议冒烟（2.0.14 卡片不显示事故）——
+   2.0.13 的挂载点是 settings.plugin.item（keyed），2.0.14 改为 plugins.item
+   （官方插件页，id/order/label + view:summary|page）。错配协议 = 卡片注册进
+   无人消费的 slot，UI 上"插件已装但配置不出现"。这里 mock 客户端 ctx 执行
+   真实 apply，断言两代协议的注册形态。 */
+if (registration) {
 	try {
-		const bundle = readFileSync(new URL('./lib/client.js', import.meta.url), 'utf8');
-		const queue = [];
-		globalThis.window = globalThis;
-		globalThis.__ModuleLoader__ = { mode: 'queue', pendingQueue: queue, load: (reg) => { queue.push(reg); } };
-		// 执行 bundle（只注册 factory，不运行模块体）
-		new Function(bundle)();
-		const registration = queue.find((r) => r && r.id === 'dsh-proxy-routes');
-		check('client bundle：注册到 __ModuleLoader__（id=dsh-proxy-routes）', Boolean(registration));
-		if (registration) {
-			const realRequire = createRequire(new URL('./node_modules/react/package.json', import.meta.url));
-			const exports = registration.factory((spec) => realRequire(spec));
-			check('client bundle：factory 导出 apply 函数与 inject 服务数组', typeof exports.apply === 'function' && Array.isArray(exports.inject));
-			check('client bundle：inject 声明与 package.json dsh.client.inject 一致', JSON.stringify(exports.inject) === JSON.stringify(['slots', 'locale']));
-		}
+		const realRequire = createRequire(new URL('./node_modules/react/package.json', import.meta.url));
+		const exports = registration.factory((spec) => realRequire(spec));
+		const registered = []; // slots.register 捕获：[options, component]
+		const dict = { title: '代理路由', description: 'desc' };
+		const t = (key) => dict[key] ?? key;
+		const runInject = (gen) => {
+			const result = typeof gen === 'function' ? gen() : gen;
+			if (result && typeof result[Symbol.iterator] === 'function') {
+				// generator 形态（2.0.13）：register 在 yield 求值时已被下面的 mock 捕获
+				for (const _ of result) { void _; }
+			}
+		};
+		const ctx = {
+			effect: (fn) => () => { fn(); },
+			locale: { register: () => () => {}, bind: () => t },
+			slots: {
+				inject: (slot, gen) => { runInject(gen); return () => {}; },
+				register: (options, component) => { registered.push([options, component]); return () => {}; },
+			},
+		};
+		exports.apply(ctx);
+		check('client bundle：factory 导出 apply 函数与 inject 服务数组', typeof exports.apply === 'function' && JSON.stringify(exports.inject) === JSON.stringify(['slots', 'locale']));
+		const modern = registered.find(([o]) => o.name === 'plugins.item');
+		check('client apply：注册 plugins.item 且带 id/order/label（2.0.14 官方插件页形态）',
+			Boolean(modern) && modern[0].id === 'proxy-routes' && typeof modern[0].order === 'number' && typeof modern[0].label === 'function' && typeof modern[0].label() === 'string');
+		const legacy = registered.find(([o]) => o.name === 'settings.plugin.item');
+		check('client apply：注册 settings.plugin.item 且带 key（2.0.13 keyed slot 形态）',
+			Boolean(legacy) && legacy[0].key === 'proxy-routes');
+		check('client apply：组件支持 view:summary/page 渲染分支', typeof modern?.[1] === 'function');
 	} catch (error) {
-		check('client bundle 形态', false);
+		check('client apply 协议冒烟', false);
 		console.log('  ' + (error.code ?? '') + ' ' + String(error.message).split('\n')[0]);
 	}
 }

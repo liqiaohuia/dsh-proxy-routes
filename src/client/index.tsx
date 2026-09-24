@@ -1,6 +1,13 @@
-// dsh-proxy-routes —— 浏览器侧入口：把「代理路由」卡片注册进
-// 设置 → 插件 → 可配置插件（settings.plugin.item slot，由
-// @deepseek-ai/dsh-client-ui-settings-plugins 运行时声明）。
+// dsh-proxy-routes —— 浏览器侧入口：把「代理路由」配置页注册进 DSH 前端。
+//
+// 两代挂载点（双协议，兼容两个桌面版代次）：
+//  - DSH Desktop 2.0.14（dsh 0.1.5+）`plugins.item`：官方插件页（侧栏
+//    Plugins / 插件详情）消费，形态见 dsh-cordis-client-runner 内置示例
+//    （slots.register({ name:'plugins.item', id, order, label, locale }, C)）。
+//    详情页会以 view:"summary"（简介行）与 view:"page"（配置区）渲染。
+//  - DSH Desktop 2.0.13（dsh 0.1.5-rc.2）`settings.plugin.item`：设置 →
+//    插件 的 keyed slot（dsh-llm-proxy 同款形态）。
+// 两个 slot 在任一版本里都只有一个消费者，多余注册无人渲染、无害。
 //
 // 数据面见 Card.tsx：卡片走本插件 host 侧的同源回环桥，不依赖官方
 // settings 传输对第三方命名空间的透出（rc.6 apiproxy 白名单不含它）。
@@ -20,9 +27,19 @@ interface LocaleCtx {
 	bind(ns: string): (key: string, values?: Record<string, string | number>) => string
 }
 
+interface RegisterOptions {
+	name: string
+	id?: string
+	key?: string
+	order?: number
+	locale?: string
+	label?: () => string
+	inject?: () => unknown
+}
+
 interface SlotsCtx {
-	inject(slot: string, gen: () => Generator): () => void
-	register(item: { name: string; key: string; locale: string; inject: () => unknown }, component: unknown): () => void
+	inject(slot: string, gen: () => Generator | (() => unknown)): () => void
+	register(item: RegisterOptions, component: unknown): () => void
 }
 
 interface ClientContext {
@@ -32,13 +49,26 @@ interface ClientContext {
 }
 
 /**
- * 注册卡片。ctx 结构与 dsh-llm-proxy 的客户端入口一致：locale 注册双语
- * 文案，slots.inject 在 `settings.plugin.item` 声明上落后把卡片挂进去。
+ * 注册配置页。locale 注册双语文案；slots.inject 在对应 slot 声明落地后
+ * 把卡片挂进去（两个协议各注册一份，见文件头注释）。
  */
 export function apply(ctx: ClientContext): void {
 	ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-proxy-routes: copy dictionaries')
 
 	const t = ctx.locale.bind(NS)
+
+	// 2.0.14+：官方插件页的配置卡。回调直接返回 disposer（官方 companion
+	// 同款形态）；label 是函数，由宿主在渲染列表/详情标题时求值。
+	ctx.slots.inject('plugins.item', () => ctx.slots.register({
+		name: 'plugins.item',
+		id: 'proxy-routes',
+		order: 100,
+		locale: NS,
+		label: () => t('title'),
+		inject: () => ({ t }),
+	}, ProxyRoutesCard))
+
+	// 2.0.13（-rc.2）：设置 → 插件 的 keyed slot（generator 形态）。
 	ctx.slots.inject('settings.plugin.item', function* () {
 		yield ctx.slots.register({
 			name: 'settings.plugin.item',

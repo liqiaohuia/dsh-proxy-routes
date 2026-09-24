@@ -161,7 +161,19 @@ const S = {
 /** 测试结果（key = 代理名或模型 key）。 */
 type TestMap = Record<string, { pending?: boolean } & Partial<TestOutcome>>
 
-export function ProxyRoutesCard({ t }: { t: Translate }): ReactNode {
+/** 渲染形态：summary = 官方插件详情页的一行简介（父容器是 <p>，只能内联文本）；page/缺省 = 完整配置卡。 */
+type CardView = 'summary' | 'page' | undefined
+
+/**
+ * 卡片入口。本身不含 hooks，可按 view 提前分支（React Hook 规则）。
+ * 官方插件页（plugins.item）的详情里 summary 父容器是 <p>——必须内联文本。
+ */
+export function ProxyRoutesCard({ t, view }: { t: Translate; view?: CardView }): ReactNode {
+	if (view === 'summary') return t('description')
+	return <ProxyRoutesEditor t={t} />
+}
+
+function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 	const [value, setValue] = useState<DescribeValue | null>(null)
 	const [error, setError] = useState<string | null>(null)
 	const [draft, setDraft] = useState<DescribeValue | null>(null)
