@@ -24,7 +24,7 @@ import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { existsSync, watch, watchFile, unwatchFile } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { transportReady, normalizeProxyUrl, DispatcherPool, probeVia, undici } from './transport.mjs';
+import { ensureTransport, getUndici, normalizeProxyUrl, DispatcherPool, probeVia } from './transport.mjs';
 import { ensurePiAiCatalog, listModels, compileModelRoutes } from './catalog.mjs';
 
 const name = 'dsh-proxy-routes';
@@ -274,11 +274,23 @@ function makeLogger(ctx) {
 /* 主体                                                                 */
 /* ------------------------------------------------------------------ */
 
+/**
+ * **本模块不得有顶层 await**：DSH 桌面版经 require 桥加载插件（cordis-plugin-loader
+ * 的 internal.import），含 TLA 的 ESM 图会抛 ERR_REQUIRE_ASYNC_MODULE，loader 收到
+ * 空对象后在启动期报 "invalid plugin"（v0.3.0 因此导致桌面版启动错误循环）。
+ * 所有动态 import（undici / schemastery / pi-ai 目录）都在 async apply 内完成。
+ */
+
 /** schemastery（settings 注册需要；DSH 环境自带，加载失败时降级为直接配置）。 */
 let Schema = null;
-try {
-	Schema = (await import('@deepseek-ai/schemastery')).default;
-} catch { /* apply 里降级 */ }
+let schemaTried = false;
+function ensureSchema() {
+	if (schemaTried) return Promise.resolve(Schema !== null);
+	schemaTried = true;
+	return import('@deepseek-ai/schemastery')
+		.then((mod) => { Schema = mod?.default ?? null; return Schema !== null; })
+		.catch(() => false);
+}
 
 /** settings namespace 的 Schemastery schema。 */
 function makeConfigSchema() {
@@ -301,13 +313,17 @@ function makeConfigSchema() {
  * @param {import('@deepseek-ai/cordis').Context} ctx Cordis 上下文
  * @param {{enabled?: boolean, configFile?: string}} config 挂载条目配置
  */
-function apply(ctx, config = {}) {
+async function apply(ctx, config = {}) {
 	const log = makeLogger(ctx);
 	if (config && config.enabled === false) {
 		log.info(`${TAG} 已通过条目配置禁用（enabled: false）`);
 		return;
 	}
-	if (!transportReady) {
+	// 集中完成全部动态 import（见文件头「不得有顶层 await」注记）。
+	const transportOk = await ensureTransport();
+	await ensureSchema();
+	await ensurePiAiCatalog();
+	if (!transportOk || getUndici() === null) {
 		log.error(`${TAG} 传输层不可用：未能加载 DSH 自带的 undici（需 ≥ 7.10，含 Socks5ProxyAgent）。插件已跳过——请确认 DSH ≥ 0.1.3；在本仓库内独立运行测试时先安装 devDependencies（pnpm install）`);
 		return;
 	}
@@ -345,7 +361,8 @@ function apply(ctx, config = {}) {
 					const decision = state.decide(url.hostname);
 					if (decision.kind === 'proxy') {
 						const dispatcher = pool.get(decision.url);
-						if (dispatcher) {
+						const undici = getUndici();
+						if (dispatcher && undici) {
 							if (state.cfg.logRequests) {
 								log.info(`${TAG} ${(init && init.method) || 'GET'} ${url.host}${url.pathname} -> ${decision.name}:${decision.url.protocol}//${decision.url.host}`);
 							}
@@ -362,7 +379,8 @@ function apply(ctx, config = {}) {
 						const decision = state.decide(reqUrl.hostname);
 						if (decision.kind === 'proxy') {
 							const dispatcher = pool.get(decision.url);
-							if (dispatcher) {
+							const undici = getUndici();
+							if (dispatcher && undici) {
 								const mergedInit = {
 									method: (init && init.method) || input.method,
 									headers: (init && init.headers) || input.headers,
@@ -434,8 +452,8 @@ function apply(ctx, config = {}) {
 	};
 	let rawSnapshotForRecompile = null;
 
-	/** 模型目录刷新 + 路由重编译。 */
-	const refreshCatalog = async (announce = false) => {
+	/** 模型目录刷新 + 路由重编译（同步：目录加载已在 apply 顶部完成）。 */
+	const refreshCatalog = (announce = false) => {
 		if (!state.seam) return;
 		try {
 			state.rows = listModels(state.seam);
@@ -765,7 +783,10 @@ function apply(ctx, config = {}) {
 
 	if (typeof ctx?.inject === 'function') {
 		// —— settings 模式：注册 namespace + 热生效 + bridge ——
-		ctx.inject(['settings'], async (sctx) => {
+		// 回调必须**同步**（Cordis 的 inject 回调返回后 runtime session 即释放，
+		// await 之后再调 sctx.effect 会炸）；所有动态 import 已在 apply 顶部完成，
+		// 目录刷新这类异步工作放进 timer / watch 回调，绝不触碰 sctx。
+		ctx.inject(['settings'], (sctx) => {
 			const seam = sctx?.settings;
 			if (!seam || typeof seam.register !== 'function') {
 				log.warn(`${TAG} settings seam 不可用，配置仅来自条目/文件`);
@@ -789,25 +810,30 @@ function apply(ctx, config = {}) {
 						return false;
 					}
 				};
-				const applySettings = async (announce = false) => {
-					await ensurePiAiCatalog();
+				const applySettings = (announce = false) => {
 					state.rows = listModels(seam);
 					if (state.mode === 'file') return; // 文件优先，settings 值不覆盖
 					rawSnapshotForRecompile = scope.get();
 					applyRawConfig(scope.get(), `设置页(${NAMESPACE})`, announce);
 				};
-				let watchStopper = null;
 				const timers = [];
 				const scheduleRetry = (attempt) => {
 					if (attempt > 8) return;
 					const timer = setTimeout(() => {
-						void applySettings(attempt === 0).then(() => {
-							if (!providerReady()) scheduleRetry(attempt + 1);
-						});
+						try {
+							applySettings(attempt === 0);
+						} catch (error) {
+							log.warn(`${TAG} settings 首次应用失败: ${error?.message ?? error}`);
+						}
+						if (!providerReady()) scheduleRetry(attempt + 1);
 					}, 100 * 2 ** attempt);
 					timers.push(timer);
 				};
-				await applySettings(true);
+				try {
+					applySettings(true);
+				} catch (error) {
+					log.warn(`${TAG} settings 首次应用失败: ${error?.message ?? error}`);
+				}
 				if (!providerReady()) scheduleRetry(0);
 				const disposeWatch = scope.watch((next) => {
 					if (state.mode === 'file') return;
@@ -815,7 +841,9 @@ function apply(ctx, config = {}) {
 					applyRawConfig(next, `设置页(${NAMESPACE})`, false);
 				});
 				const disposeDoc = ctx.on('settings/document-updated', (ns) => {
-					if (ns !== undefined && PROVIDER_NS.has(String(ns))) void refreshCatalog(true);
+					if (ns !== undefined && PROVIDER_NS.has(String(ns))) {
+						try { refreshCatalog(true); } catch { /* 重试 timer 兜底 */ }
+					}
 				});
 				log.info(`${TAG} settings 命名空间 "${NAMESPACE}" 已注册 —— 设置 → 插件 → 代理路由 实时生效${state.mode === 'file' ? '（当前配置文件模式优先，可在卡片中一键迁移）' : ''}`);
 				sctx.effect(() => () => {

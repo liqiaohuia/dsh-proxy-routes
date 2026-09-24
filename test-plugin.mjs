@@ -1,6 +1,7 @@
 // dsh-proxy-routes —— v0.3 测试脚本（无依赖，直接 node 运行）。
-// 覆盖：文件模式加载 / 双代理池路由 / 直连 / 模型路由编译（单元） /
-// normalizeProxyUrl 归一化（单元） / dispatcher 池缓存（单元） / 热重载 / 卸载还原。
+// 覆盖：require 兼容回归（防桌面版 invalid plugin 事故）/ 文件模式加载 /
+// 双代理池路由 / 直连 / 模型路由编译（单元）/ normalizeProxyUrl 归一化（单元）/
+// dispatcher 池缓存（单元）/ 热重载 / 卸载还原。
 //
 // 运行：node test-plugin.mjs
 // 前置：本机 50939 / 50018 两个 SOCKS5 代理在监听（xray）；未监听时网络用例报 FAIL。
@@ -11,12 +12,33 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { createRequire } from 'node:module';
+
+let pass = 0, fail = 0, skip = 0;
+const check = (label, ok) => {
+	if (ok === null) { skip++; console.log(`⏭ SKIP ${label}`); return; }
+	ok ? (pass++, console.log(`✓ PASS ${label}`)) : (fail++, console.log(`✗ FAIL ${label}`));
+};
+
+// —— 用例 0：require 兼容回归（桌面版 loader 用 require 桥加载插件——
+//    顶层 await 会让 require 抛 ERR_REQUIRE_ASYNC_MODULE，loader 收到空对象后
+//    报 "invalid plugin" 并阻塞启动；v0.3.0 事故的直接回归测试）——
+{
+	const require_ = createRequire(import.meta.url);
+	try {
+		const plugin = require_('./index.mjs');
+		check('require() 可加载插件且 exports.apply 是函数（桌面版 loader 形态）', plugin && typeof plugin.apply === 'function');
+	} catch (error) {
+		check('require() 可加载插件且 exports.apply 是函数（桌面版 loader 形态）', false);
+		console.log('  ' + (error.code ?? '') + ' ' + String(error.message).split('\n')[0]);
+	}
+}
 
 // —— 前置检查：undici 可用（devDependencies 已安装 / DSH 环境自带）——
 try {
 	await import('undici');
 } catch {
-	console.error('✗ 未找到 undici —— 请先在仓库内执行: ppm install（或 pnpm install）');
+	console.error('✗ 未找到 undici —— 请先在仓库内执行: pnpm install');
 	process.exit(1);
 }
 
@@ -54,11 +76,6 @@ const configText = `{
 writeFileSync(CONFIG, configText, 'utf8');
 process.env.DSH_HOME = HOME;
 
-let pass = 0, fail = 0, skip = 0;
-const check = (label, ok) => {
-	if (ok === null) { skip++; console.log(`⏭ SKIP ${label}`); return; }
-	ok ? (pass++, console.log(`✓ PASS ${label}`)) : (fail++, console.log(`✗ FAIL ${label}`));
-};
 const assertLog = (substr) => logs.some((line) => line.includes(substr));
 
 /* —— 1. 文件模式加载 —— */

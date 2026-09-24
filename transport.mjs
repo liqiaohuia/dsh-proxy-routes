@@ -10,20 +10,41 @@
 // - http:// / https:// 代理：CONNECT 隧道（https 为代理端 TLS）；代理侧禁用空闲
 //   连接复用，规避 Clash 等静默关闭空闲隧道导致 undici 复用死连接的挂起问题
 //   （clientFactory + pipelining: 0，实证 workaround 另见 dsh-llm-proxy）
+//
+// **本模块不得有顶层 await**：DSH 桌面版经 require 桥加载插件，含 TLA 的
+// ESM 图会抛 ERR_REQUIRE_ASYNC_MODULE（v0.3.0 因此导致桌面版启动报错）。
+// undici 通过 ensureTransport() 在插件 apply 时惰性加载。
 
-/** 已加载的 undici 模块（模块加载时解析一次；失败由 index.mjs 报告）。 */
+/** 已加载的 undici 模块；null = 未加载或不可用（详见 ensureTransport）。 */
 export let undici = null;
-try {
-	undici = await import('undici');
-} catch { /* 由 index.mjs 的 apply 报告 */ }
+let transportLoaded = false;
+let transportPromise = null;
 
-/** 传输层是否可用（undici 及所需的三个导出都在）。 */
-export const transportReady = Boolean(
-	undici
-	&& typeof undici.fetch === 'function'
-	&& typeof undici.Socks5ProxyAgent === 'function'
-	&& typeof undici.ProxyAgent === 'function',
-);
+/**
+ * 确保 undici 已加载（幂等、并发安全）。失败（未安装）时 undici 保持 null。
+ * 在 apply 顶部 await 一次，之后本模块的同步读面即可用。
+ * @returns {Promise<boolean>} 传输层是否可用
+ */
+export function ensureTransport() {
+	if (transportLoaded) return Promise.resolve(undici !== null);
+	if (transportPromise === null) {
+		transportPromise = import('undici')
+			.then((mod) => { undici = mod; return true; })
+			.catch(() => false)
+			.finally(() => { transportLoaded = true; });
+	}
+	return transportPromise;
+}
+
+/**
+ * undici 的同步读面（ensureTransport() 完成后使用）。
+ * @returns {typeof import('undici')} 已加载的 undici；未加载时为 null
+ */
+export function getUndici() {
+	return undici && typeof undici.fetch === 'function' && typeof undici.Socks5ProxyAgent === 'function' && typeof undici.ProxyAgent === 'function'
+		? undici
+		: null;
+}
 
 /**
  * 校验并归一化一个代理地址字符串。
