@@ -173,6 +173,19 @@ export function ProxyRoutesCard({ t, view }: { t: Translate; view?: CardView }):
 	return <ProxyRoutesEditor t={t} />
 }
 
+/**
+ * 独立设置页（settings.section，保底入口）：设置 → 代理路由。
+ * 自身不含 hooks；完整编辑器在 ProxyRoutesEditor 里。
+ */
+export function ProxyRoutesSettingsSection({ t }: { t: Translate }): ReactNode {
+	return (
+		<div style={{ display: 'flex', flexDirection: 'column', gap: '8px', color: 'var(--dsw-alias-label-primary)' }}>
+			<p style={{ margin: 0, fontSize: '13px', color: 'var(--dsw-alias-label-tertiary)' }}>{t('description')}</p>
+			<ProxyRoutesEditor t={t} />
+		</div>
+	)
+}
+
 function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 	const [value, setValue] = useState<DescribeValue | null>(null)
 	const [error, setError] = useState<string | null>(null)

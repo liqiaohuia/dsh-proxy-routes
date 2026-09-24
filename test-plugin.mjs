@@ -210,6 +210,9 @@ if (registration) {
 		const modern = registered.find(([o]) => o.name === 'plugins.item');
 		check('client apply：注册 plugins.item 且带 id/order/label（2.0.14 官方插件页形态）',
 			Boolean(modern) && modern[0].id === 'proxy-routes' && typeof modern[0].order === 'number' && typeof modern[0].label === 'function' && typeof modern[0].label() === 'string');
+		const section = registered.find(([o]) => o.name === 'settings.section');
+		check('client apply：注册 settings.section 独立设置页（保底入口，带 id/label）',
+			Boolean(section) && section[0].id === 'proxy-routes' && typeof section[0].label === 'function' && typeof section[0].label() === 'string');
 		const legacy = registered.find(([o]) => o.name === 'settings.plugin.item');
 		check('client apply：注册 settings.plugin.item 且带 key（2.0.13 keyed slot 形态）',
 			Boolean(legacy) && legacy[0].key === 'proxy-routes');
