@@ -7,7 +7,7 @@
 // 前置：本机 50939 / 50018 两个 SOCKS5 代理在监听（xray）；未监听时网络用例报 FAIL。
 // 独立运行（仓库内）需先 pnpm install（devDependencies 提供 undici）。
 
-import { copyFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -156,6 +156,33 @@ try {
 	check('模型路由：direct 显式生效', hostRoutes.get('b.example.com') === 'direct');
 	check('模型路由：未知 key 记入 conflicts', conflicts.some((c) => c.includes('p9/m9')));
 	check('模型路由：host 冲突记入 conflicts', conflicts.some((c) => c.includes('同域名')));
+}
+
+/* —— 10. 浏览器端 client 模块形态回归（v0.3.1.1 事故）——
+   esbuild iife 丢弃 ESM 导出 → factory 产出空 module.exports → 浏览器 loader
+   报 "invalid plugin" 并在 DSH 启动页弹错（host 半边正常，极易误判）。这里
+   完整模拟浏览器 ModuleLoader：执行 bundle 注册、真实 materialize factory、
+   断言导出形态。react 走工作区 devDependency。 */
+{
+	try {
+		const bundle = readFileSync(new URL('./lib/client.js', import.meta.url), 'utf8');
+		const queue = [];
+		globalThis.window = globalThis;
+		globalThis.__ModuleLoader__ = { mode: 'queue', pendingQueue: queue, load: (reg) => { queue.push(reg); } };
+		// 执行 bundle（只注册 factory，不运行模块体）
+		new Function(bundle)();
+		const registration = queue.find((r) => r && r.id === 'dsh-proxy-routes');
+		check('client bundle：注册到 __ModuleLoader__（id=dsh-proxy-routes）', Boolean(registration));
+		if (registration) {
+			const realRequire = createRequire(new URL('./node_modules/react/package.json', import.meta.url));
+			const exports = registration.factory((spec) => realRequire(spec));
+			check('client bundle：factory 导出 apply 函数与 inject 服务数组', typeof exports.apply === 'function' && Array.isArray(exports.inject));
+			check('client bundle：inject 声明与 package.json dsh.client.inject 一致', JSON.stringify(exports.inject) === JSON.stringify(['slots', 'locale']));
+		}
+	} catch (error) {
+		check('client bundle 形态', false);
+		console.log('  ' + (error.code ?? '') + ' ' + String(error.message).split('\n')[0]);
+	}
 }
 
 /* —— 清理 —— */
