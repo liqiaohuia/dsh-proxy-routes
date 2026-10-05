@@ -1,14 +1,17 @@
-// dsh-proxy-routes —— DSH 代理路由插件：按「模型 / 域名」分流，支持命名代理池。
+// dsh-proxy-routes —— DSH 代理路由插件：按「提供商（账号）/ 域名」分流，支持命名代理池。
 //
 // 配置来源（优先级从高到低）：
 //   1. 配置文件（$DSH_HOME/proxy-routes.jsonc，JSONC 语法，保存热生效）—— v0.2
 //      及以前用户的既有入口；存在即生效，设置页卡片提供一键迁移
-//   2. DSH settings（设置 → 插件 → 插件配置 → 代理路由 卡片，官方 settings 机制，
-//      `applies: 'live'` 保存即热生效，写入 settings.yaml 的 proxy-routes 命名空间）
+//   2. DSH settings：dsh 0.1.5 为 seam.register() 命名空间；dsh 0.1.7 起改为
+//      「从插件导出的 Config schema 派生」——本插件导出 volatile 字段的 Config，
+//      官方设置表单可直接编辑，卡片保存走 SettingsForms.mutate（同一 op 协议）
 //
-// 路由语义：传输层只能看到请求 URL，因此「按模型」的实际实现是
-// 「模型 → 其 provider 的 baseURL host → 代理」（与官方模型选择器一致）。
-// 同一域名下的模型共享同一路由；卡片按 host 分组提示。
+// 路由语义（v0.4）：每个 LLM 请求都会带上其提供商的 API 密钥头
+// （x-api-key / authorization: Bearer），fetch 补丁据此刻意识别「本次请求属于
+// 哪个提供商（账号）」，实现同一域名下多账号走不同代理——这是域名规则做不到
+// 的。优先级：提供商显式走向 > 域名规则 > 默认走向。旧版「按模型」的
+// modelRoutes 在归一化时自动迁移为按提供商（取 "providerId/modelId" 的前缀）。
 //
 // 传输层（transport.mjs）：DSH 自带 undici——Socks5ProxyAgent（socks5h 语义，
 // 域名在代理端解析）/ ProxyAgent（http(s):// CONNECT，代理端 TLS + 认证），
@@ -19,13 +22,17 @@
 // 因此像 dsh-llm-proxy 一样在本机回环上自设同源 HTTP 桥
 // （/api/dsh-proxy-routes/settings/{describe,mutate,models,test,migrate}），
 // 走官方 settings seam 校验/持久化/事件。仅本机可访问。
+//
+// 注意：schemastery 在模块顶层静态导入（export const Config 需要在加载期就绪）。
+// 静态 import 不含顶层 await，不影响桌面版 require(esm) 桥（v0.3.1 的教训只针对 TLA）。
 
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { existsSync, watch, watchFile, unwatchFile } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import Schema from '@deepseek-ai/schemastery';
 import { ensureTransport, getUndici, normalizeProxyUrl, DispatcherPool, probeVia } from './transport.mjs';
-import { ensurePiAiCatalog, listModels, compileModelRoutes } from './catalog.mjs';
+import { ensurePiAiCatalog, listModels } from './catalog.mjs';
 
 const name = 'dsh-proxy-routes';
 const inject = [];
@@ -58,8 +65,11 @@ function normalizeRawConfig(raw, label) {
 	}
 	// 单代理（v0.2 兼容）：相当于池里的 'default'
 	let singleProxy = null;
-	if (typeof raw.proxy === 'string' && raw.proxy.trim() !== '') {
-		singleProxy = normalizeProxyUrl(raw.proxy, `${TAG} ${label} 的 "proxy"`);
+	const singleRaw = typeof raw.singleProxy === 'string' && raw.singleProxy.trim() !== ''
+		? raw.singleProxy
+		: (typeof raw.proxy === 'string' && raw.proxy.trim() !== '' ? raw.proxy : null);
+	if (singleRaw !== null) {
+		singleProxy = normalizeProxyUrl(singleRaw, `${TAG} ${label} 的 "singleProxy"`);
 		if (!proxies.has('default')) proxies.set('default', singleProxy);
 	}
 	// 默认走向
@@ -78,7 +88,15 @@ function normalizeRawConfig(raw, label) {
 			return { domains, via: route.via };
 		}));
 	}
-	// 按模型路由（原始记录，编译推迟到拿到模型目录后）
+	// 按提供商路由（v0.4）：providerId → via。同域名的不同账号可走不同代理。
+	const providerRoutes = {};
+	if (raw.providerRoutes !== undefined) {
+		if (typeof raw.providerRoutes !== 'object' || raw.providerRoutes === null || Array.isArray(raw.providerRoutes)) {
+			throw new Error(`${TAG} ${label} 的 "providerRoutes" 必须是 providerId → 代理名/direct 的对象`);
+		}
+		Object.assign(providerRoutes, raw.providerRoutes);
+	}
+	// 按模型路由（v0.3 遗留）：自动迁移为按提供商——取 "providerId/modelId" 的前缀
 	const modelRoutes = {};
 	if (raw.modelRoutes !== undefined) {
 		if (typeof raw.modelRoutes !== 'object' || raw.modelRoutes === null || Array.isArray(raw.modelRoutes)) {
@@ -86,11 +104,20 @@ function normalizeRawConfig(raw, label) {
 		}
 		Object.assign(modelRoutes, raw.modelRoutes);
 	}
+	for (const [key, via] of Object.entries(modelRoutes)) {
+		const slash = key.indexOf('/');
+		const pid = slash > 0 ? key.slice(0, slash) : '';
+		if (pid && providerRoutes[pid] === undefined) providerRoutes[pid] = via;
+	}
+	for (const [pid, via] of Object.entries(providerRoutes)) {
+		if (typeof via !== 'string' || via.trim() === '') delete providerRoutes[pid];
+	}
 	return {
 		proxies,
 		singleProxy,
 		defaultVia,
 		domainRules,
+		providerRoutes,
 		modelRoutes,
 		logRequests: raw.logRequests !== false,
 		probeUrl: typeof raw.probeUrl === 'string' && raw.probeUrl.trim() !== '' ? raw.probeUrl.trim() : 'https://www.gstatic.com/generate_204',
@@ -113,14 +140,15 @@ function resolveVia(via, cfg, label) {
 }
 
 /**
- * 编译完整的路由决策表：hostname → via 决策（模型 host 规则优先，其次域名规则，最后 default）。
+ * 编译完整的路由决策表：hostname → via 决策（域名规则优先，最后 default），
+ * 以及 providerId → via 决策表（fetch 层按请求密钥识别提供商后使用，
+ * 同域名多账号可各自分流——这是域名规则做不到的）。
  * @param {object} cfg normalizeRawConfig 的输出
- * @param {ReturnType<typeof listModels>} rows 当前模型目录
  * @returns {{decide: (hostname: string) => {kind:'direct'} | {kind:'proxy', name: string, url: URL},
- *            modelConflicts: string[], unknownProxies: string[]}}
+ *            providerDecisions: Map<string, {kind:'direct'} | {kind:'proxy', name: string, url: URL}>,
+ *            unknownProxies: string[]}}
  */
-function compileRouting(cfg, rows) {
-	const { hostRoutes, conflicts } = compileModelRoutes(rows, cfg.modelRoutes);
+function compileRouting(cfg) {
 	const unknownProxies = [];
 	// 预检所有 via 的可解析性（未知代理名记警告，路由时按 direct 兜底）
 	const checked = new Map();
@@ -140,14 +168,6 @@ function compileRouting(cfg, rows) {
 	const defaultDecision = checkVia(cfg.defaultVia, 'default');
 	const decide = (hostname) => {
 		const h = String(hostname || '').toLowerCase();
-		const modelVia = hostRoutes.get(h);
-		if (modelVia !== undefined) {
-			const decision = checkVia(modelVia, `modelRoutes[${h}]`);
-			if (decision.kind === 'proxy') return decision;
-			// 模型路由显式 direct：直接直连（不再落域名规则）
-			if (modelVia === 'direct') return { kind: 'direct' };
-			return decision;
-		}
 		for (const rule of cfg.domainRules) {
 			for (const domain of rule.domains) {
 				if (h === domain || h.endsWith('.' + domain)) {
@@ -160,7 +180,11 @@ function compileRouting(cfg, rows) {
 		}
 		return defaultDecision;
 	};
-	return { decide, modelConflicts: conflicts, unknownProxies };
+	const providerDecisions = new Map();
+	for (const [pid, via] of Object.entries(cfg.providerRoutes ?? {})) {
+		providerDecisions.set(pid, checkVia(via, `providerRoutes[${pid}]`));
+	}
+	return { decide, providerDecisions, unknownProxies };
 }
 
 /* ------------------------------------------------------------------ */
@@ -223,8 +247,13 @@ const DEFAULT_CONFIG_TEMPLATE = `{
   //
   // default —— 没命中任何规则的域名走哪条路："direct"、代理名或 "proxy"（单代理）
   //
-  // modelRoutes —— 按模型设置（v0.3）："providerId/modelId" → 代理名 / "direct"。
-  //   实际按该模型 provider 的 API 域名生效：同一域名下的模型共享同一路由。
+  // providerRoutes —— 按提供商（账号）分流（v0.4）："providerId" → 代理名 / "direct"。
+  //   插件按每个请求携带的 API 密钥识别它属于哪个提供商（账号），因此同一模型
+  //   服务商的多个账号可以各走各的代理——例如：
+  //     "providerRoutes": { "claude1": "proxy", "claude2": "direct" }
+  //   claude1 的请求走代理（免费额度、限制次数），claude2 直连（付费主力）。
+  //   未列出的提供商按 routes 域名规则 / default 走。
+  //   提供商 id 即 DSH「模型」页里各账号的提供商 ID（claude1、claude2、…）。
   //
   // routes —— 按域名分流，从上到下匹配，第一条命中生效。
   //   domains 写域名自动覆盖子域名；via = 代理名 / "direct" / "proxy"
@@ -281,24 +310,36 @@ function makeLogger(ctx) {
  * 所有动态 import（undici / schemastery / pi-ai 目录）都在 async apply 内完成。
  */
 
-/** schemastery（settings 注册需要；DSH 环境自带，加载失败时降级为直接配置）。 */
-let Schema = null;
-let schemaTried = false;
-function ensureSchema() {
-	if (schemaTried) return Promise.resolve(Schema !== null);
-	schemaTried = true;
-	return import('@deepseek-ai/schemastery')
-		.then((mod) => { Schema = mod?.default ?? null; return Schema !== null; })
-		.catch(() => false);
-}
+/**
+ * 条目 Config schema（dsh 0.1.7+）：导出后官方设置从它派生我们的表单，卡片
+ * 保存走 SettingsForms.mutate。可在线编辑的字段标记 `.volatile()`（SettingsForms
+ * 只接受 volatile 路径的写入），值在 apply 里以引用形式到达，用 `.get()` 解包。
+ * configFile / trustedOrigins 不标 volatile：改动它们本来就该重挂载。
+ */
+const CONFIG_FIELDS = {
+	configFile: Schema.string().default(''),
+	trustedOrigins: Schema.array(Schema.string()).default([]),
+	proxies: Schema.dict(Schema.string()).default({}).volatile(),
+	singleProxy: Schema.string().default('').volatile(),
+	default: Schema.string().default('direct').volatile(),
+	providerRoutes: Schema.dict(Schema.string()).default({}).volatile(),
+	modelRoutes: Schema.dict(Schema.string()).default({}).volatile(),
+	routes: Schema.array(Schema.object({
+		domains: Schema.array(Schema.string()),
+		via: Schema.string(),
+	})).default([]).volatile(),
+	logRequests: Schema.boolean().default(true).volatile(),
+	probeUrl: Schema.string().default('https://www.gstatic.com/generate_204').volatile(),
+};
+export const Config = Schema.object(CONFIG_FIELDS);
 
-/** settings namespace 的 Schemastery schema。 */
-function makeConfigSchema() {
-	if (!Schema) return null;
+/** 0.1.5 的 seam.register() 通道用同一套字段（不带 volatile：旧版无热更语义）。 */
+function makeRegisterSchema() {
 	return Schema.object({
-		proxy: Schema.string().default(''),
+		singleProxy: Schema.string().default(''),
 		proxies: Schema.dict(Schema.string()).default({}),
 		default: Schema.string().default('direct'),
+		providerRoutes: Schema.dict(Schema.string()).default({}),
 		modelRoutes: Schema.dict(Schema.string()).default({}),
 		routes: Schema.array(Schema.object({
 			domains: Schema.array(Schema.string()),
@@ -309,19 +350,29 @@ function makeConfigSchema() {
 	});
 }
 
+/** volatile 字段到达 apply 时是引用（`.get()` 读取）；这里统一解包为普通对象。 */
+function unwrapVolatileConfig(config) {
+	if (config === null || typeof config !== 'object') return config;
+	const out = {};
+	for (const [key, value] of Object.entries(config)) {
+		out[key] = value !== null && typeof value === 'object' && typeof value.get === 'function' ? value.get() : value;
+	}
+	return out;
+}
+
 /**
  * @param {import('@deepseek-ai/cordis').Context} ctx Cordis 上下文
- * @param {{enabled?: boolean, configFile?: string}} config 挂载条目配置
+ * @param {object} config 挂载条目配置（0.1.7 的 volatile 字段为引用形态）
  */
 async function apply(ctx, config = {}) {
 	const log = makeLogger(ctx);
+	config = unwrapVolatileConfig(config);
 	if (config && config.enabled === false) {
 		log.info(`${TAG} 已通过条目配置禁用（enabled: false）`);
 		return;
 	}
 	// 集中完成全部动态 import（见文件头「不得有顶层 await」注记）。
 	const transportOk = await ensureTransport();
-	await ensureSchema();
 	await ensurePiAiCatalog();
 	if (!transportOk || getUndici() === null) {
 		log.error(`${TAG} 传输层不可用：未能加载 DSH 自带的 undici（需 ≥ 7.10，含 Socks5ProxyAgent）。插件已跳过——请确认 DSH ≥ 0.1.3；在本仓库内独立运行测试时先安装 devDependencies（pnpm install）`);
@@ -337,16 +388,77 @@ async function apply(ctx, config = {}) {
 		cfg: null,
 		/** 路由决策函数（compileRouting.decide）。 */
 		decide: null,
+		/** 提供商 → 决策（compileRouting.providerDecisions）。 */
+		providerDecisions: new Map(),
+		/** API 密钥 → 提供商 id（内存使用，绝不写日志）。 */
+		keyRoutes: new Map(),
 		/** 当前模型目录（listModels 输出，settings 模式热刷新）。 */
 		rows: [],
 		/** 'file' | 'settings' */
 		mode: null,
 		originalFetch: null,
 		patchedFetch: null,
-		/** settings seam（注册成功后引用），文件模式为 null。 */
+		/** settings seam（describe/mutate/……），文件模式或不可用时为 null。 */
 		seam: null,
 	};
 	const pool = new DispatcherPool();
+
+	/* —— 请求密钥提取 + 提供商级决策（v0.4 核心）—— */
+	/** 从 fetch 的 headers 参数（Headers 实例 / 普通对象 / [name, value] 数组）读一个头。 */
+	const headerValue = (headers, name) => {
+		if (headers === null || headers === undefined) return undefined;
+		if (typeof headers.get === 'function') {
+			const hit = headers.get(name);
+			return typeof hit === 'string' && hit !== '' ? hit : undefined;
+		}
+		if (Array.isArray(headers)) {
+			for (const pair of headers) {
+				if (Array.isArray(pair) && String(pair[0]).toLowerCase() === name) {
+					const hit = pair[1];
+					return hit === null || hit === undefined ? undefined : String(hit);
+				}
+			}
+			return undefined;
+		}
+		if (typeof headers === 'object') {
+			for (const [key, value] of Object.entries(headers)) {
+				if (String(key).toLowerCase() === name && value !== null && value !== undefined && String(value) !== '') {
+					return String(value);
+				}
+			}
+		}
+		return undefined;
+	};
+	/**
+	 * 提取请求携带的 API 密钥（llm-pi-ai 的出站协议：anthropic-messages 用
+	 * x-api-key，其余用 authorization: Bearer）。仅内存匹配，绝不落日志。
+	 */
+	const extractApiKey = (input, init) => {
+		for (const headers of [init?.headers, input?.headers]) {
+			const direct = headerValue(headers, 'x-api-key');
+			if (direct !== undefined) return direct;
+			const auth = headerValue(headers, 'authorization');
+			if (auth !== undefined && auth.startsWith('Bearer ')) return auth.slice(7).trim();
+		}
+		return undefined;
+	};
+	/**
+	 * 一次请求的完整决策：先按密钥识别提供商（同域名多账号可各走各的），
+	 * 未命中再落域名规则 + 默认走向。
+	 */
+	const decideForRequest = (url, input, init) => {
+		if (state.keyRoutes.size > 0) {
+			const key = extractApiKey(input, init);
+			if (key !== undefined) {
+				const pid = state.keyRoutes.get(key);
+				if (pid !== undefined) {
+					const providerDecision = state.providerDecisions.get(pid);
+					if (providerDecision !== undefined) return { decision: providerDecision, provider: pid };
+				}
+			}
+		}
+		return { decision: state.decide(url.hostname), provider: null };
+	};
 
 	/* —— fetch 补丁 —— */
 	const ensurePatched = () => {
@@ -358,13 +470,13 @@ async function apply(ctx, config = {}) {
 				if (typeof input === 'string') url = new URL(input);
 				else if (input instanceof URL) url = input;
 				if (url && state.cfg && state.decide && (url.protocol === 'https:' || url.protocol === 'http:')) {
-					const decision = state.decide(url.hostname);
+					const { decision, provider } = decideForRequest(url, input, init);
 					if (decision.kind === 'proxy') {
 						const dispatcher = pool.get(decision.url);
 						const undici = getUndici();
 						if (dispatcher && undici) {
 							if (state.cfg.logRequests) {
-								log.info(`${TAG} ${(init && init.method) || 'GET'} ${url.host}${url.pathname} -> ${decision.name}:${decision.url.protocol}//${decision.url.host}`);
+								log.info(`${TAG} ${(init && init.method) || 'GET'} ${url.host}${url.pathname} -> ${provider ? `${provider}=>` : ''}${decision.name}:${decision.url.protocol}//${decision.url.host}`);
 							}
 							return undici.fetch(url, { ...init, dispatcher });
 						}
@@ -376,7 +488,7 @@ async function apply(ctx, config = {}) {
 				if (input && typeof input === 'object' && typeof input.url === 'string') {
 					const reqUrl = new URL(input.url);
 					if (state.cfg && state.decide && (reqUrl.protocol === 'https:' || reqUrl.protocol === 'http:')) {
-						const decision = state.decide(reqUrl.hostname);
+						const { decision, provider } = decideForRequest(reqUrl, input, init);
 						if (decision.kind === 'proxy') {
 							const dispatcher = pool.get(decision.url);
 							const undici = getUndici();
@@ -389,7 +501,7 @@ async function apply(ctx, config = {}) {
 									duplex: 'half',
 								};
 								if (state.cfg.logRequests) {
-									log.info(`${TAG} ${mergedInit.method || 'GET'} ${reqUrl.host}${reqUrl.pathname} -> ${decision.name}:${decision.url.protocol}//${decision.url.host}`);
+									log.info(`${TAG} ${mergedInit.method || 'GET'} ${reqUrl.host}${reqUrl.pathname} -> ${provider ? `${provider}=>` : ''}${decision.name}:${decision.url.protocol}//${decision.url.host}`);
 								}
 								return undici.fetch(reqUrl, { ...mergedInit, dispatcher });
 							}
@@ -429,23 +541,23 @@ async function apply(ctx, config = {}) {
 		const wanted = new Map();
 		for (const [proxyName, url] of cfg.proxies) wanted.set(url.href, url);
 		pool.rebuild(wanted);
-		const routing = compileRouting(cfg, state.rows);
+		const routing = compileRouting(cfg);
 		state.cfg = cfg;
 		state.decide = routing.decide;
+		state.providerDecisions = routing.providerDecisions;
 		ensurePatched();
-		for (const message of routing.modelConflicts) log.warn(`${TAG} 模型路由: ${message}`);
 		for (const message of routing.unknownProxies) log.warn(`${TAG} ${message}`);
 		if (announce) {
 			const viaLabel = (via) => via === 'direct' ? '直连' : via === 'proxy' ? '代理' : via;
 			const domainSummary = cfg.domainRules.map((r) => `${r.domains.join(',')}=>${viaLabel(r.via)}`).join('；');
-			const modelCount = Object.keys(cfg.modelRoutes).length;
+			const providerSummary = Object.entries(cfg.providerRoutes).map(([pid, via]) => `${pid}=>${viaLabel(via)}`).join('，');
 			const poolNames = [...cfg.proxies.keys()].join(',');
-			log.info(`${TAG} 配置已加载 ${label}（代理池=[${poolNames || '无'}]，默认=${viaLabel(cfg.defaultVia)}，域名规则[${domainSummary}]，模型路由 ${modelCount} 条，来源=${state.mode === 'file' ? '配置文件' : '设置页'}）`);
+			log.info(`${TAG} 配置已加载 ${label}（代理池=[${poolNames || '无'}]，默认=${viaLabel(cfg.defaultVia)}，域名规则[${domainSummary}]，提供商路由[${providerSummary}]，来源=${state.mode === 'file' ? '配置文件' : '设置页'}）`);
 		}
 		return true;
 	};
 
-	/** 重新编译路由（模型目录变化时调用，配置不变）。 */
+	/** 重新编译路由（密钥映射变化时调用，配置不变）。 */
 	const recompile = (announce) => {
 		if (!state.cfg) return;
 		applyRawConfig(rawSnapshotForRecompile, `${state.mode === 'file' ? configFile : '设置页(proxy-routes)'}（目录更新）`, announce === true);
@@ -459,6 +571,63 @@ async function apply(ctx, config = {}) {
 			state.rows = listModels(state.seam);
 		} catch { /* 保持旧目录 */ }
 		if (rawSnapshotForRecompile) recompile(announce);
+	};
+
+	/**
+	 * 重建「API 密钥 → 提供商」映射：settings describe（未脱敏）读到各提供商的
+	 * apiKeyEnv 引用，再经 credentials 服务解析成密钥。密钥只进内存，绝不写日志。
+	 * @returns {Promise<boolean>} describe 可用即为 true（无提供商也允许）
+	 */
+	const rebuildKeyRoutes = async () => {
+		const seam = state.seam;
+		if (!seam || typeof seam.describe !== 'function') return false;
+		let rows;
+		try {
+			rows = seam.describe();
+		} catch {
+			return false;
+		}
+		let credentials;
+		try {
+			credentials = typeof ctx?.get === 'function' ? ctx.get('credentials') : undefined;
+		} catch {
+			credentials = undefined;
+		}
+		const next = new Map();
+		for (const row of rows ?? []) {
+			const providers = row?.value?.providers;
+			if (providers === null || typeof providers !== 'object' || Array.isArray(providers)) continue;
+			for (const [pid, profile] of Object.entries(providers)) {
+				if (profile === null || typeof profile !== 'object') continue;
+				// 判定 pi-ai 提供商形态：apiKeyEnv / apiKey / baseURL / models 至少其一
+				const shape = typeof profile.apiKeyEnv === 'string' || typeof profile.apiKey === 'string'
+					|| typeof profile.baseURL === 'string' || Array.isArray(profile.models);
+				if (!shape) continue;
+				let key;
+				if (typeof profile.apiKey === 'string' && profile.apiKey !== '') {
+					key = profile.apiKey;
+				} else if (typeof profile.apiKeyEnv === 'string' && profile.apiKeyEnv !== '') {
+					const ref = profile.apiKeyEnv;
+					try {
+						const hit = credentials !== undefined && typeof credentials.resolve === 'function'
+							? (await credentials.resolve(ref))?.value
+							: process.env[ref];
+						if (typeof hit === 'string' && hit !== '') key = hit;
+					} catch { /* 该提供商暂无凭据 */ }
+				}
+				if (key === undefined) continue;
+				const existing = next.get(key);
+				if (existing !== undefined) {
+					if (existing !== pid) log.warn(`${TAG} 提供商 "${pid}" 与 "${existing}" 的密钥相同，按先者生效`);
+					continue;
+				}
+				next.set(key, pid);
+			}
+		}
+		state.keyRoutes = next;
+		const names = [...new Set(next.values())];
+		log.info(`${TAG} 密钥→提供商映射已建立：${next.size} 条（提供商 ${names.join(', ') || '无'}）`);
+		return true;
 	};
 
 	/* —— 文件模式（v0.2 兼容）—— */
@@ -597,6 +766,20 @@ async function apply(ctx, config = {}) {
 			res.writeHead(status, { 'content-type': 'application/json' });
 			res.end(JSON.stringify(payload));
 		};
+		/** 提供商清单（卡片「按提供商」区）：目录行 + 密钥映射。绝不包含密钥本体。 */
+		const providerRows = () => {
+			const byId = new Map();
+			for (const row of state.rows) {
+				const hit = byId.get(row.providerId);
+				if (hit === undefined) byId.set(row.providerId, { id: row.providerId, host: row.host, hasKey: false, via: state.cfg?.providerRoutes?.[row.providerId] ?? '' });
+				else if (hit.host === '' && row.host !== '') hit.host = row.host;
+			}
+			for (const pid of new Set(state.keyRoutes.values())) {
+				if (!byId.has(pid)) byId.set(pid, { id: pid, host: '', hasKey: true, via: state.cfg?.providerRoutes?.[pid] ?? '' });
+				else byId.get(pid).hasKey = true;
+			}
+			return [...byId.values()];
+		};
 		/** 当前生效配置的摘要（卡片状态区：文件模式提示 + 冲突列表）。 */
 		const statusPayload = () => ({
 			ok: true,
@@ -607,11 +790,12 @@ async function apply(ctx, config = {}) {
 				proxies: Object.fromEntries([...state.cfg?.proxies.entries() ?? []].map(([n, u]) => [n, u.href])),
 				singleProxy: state.cfg?.singleProxy?.href ?? null,
 				default: state.cfg?.defaultVia ?? 'direct',
-				modelRoutes: state.cfg?.modelRoutes ?? {},
+				providerRoutes: state.cfg?.providerRoutes ?? {},
 				routes: state.cfg?.domainRules ?? [],
 				logRequests: state.cfg?.logRequests ?? true,
 				probeUrl: state.cfg?.probeUrl ?? 'https://www.gstatic.com/generate_204',
 				rows: state.rows.map((row) => ({ ...row })),
+				providers: providerRows(),
 			},
 		});
 		/** 0.1.7+ 的 settings 从插件 Config schema 派生，没有 register()/mutate
@@ -680,7 +864,18 @@ async function apply(ctx, config = {}) {
 				} catch {
 					probeUrl = new URL('https://www.gstatic.com/generate_204');
 				}
-				// kind: 'proxy'（按代理名/单代理测）或 'model'（按模型 key，走它当前的路由）
+				// kind: 'proxy'（按代理名/单代理测）、'provider'（按提供商 id）或
+				// 'model'（按模型 key）——后两者先看提供商显式走向，再落域名/默认
+				const probeRoute = async (decision, key) => {
+					if (decision.kind === 'direct') {
+						const result = await probeVia(probeUrl, null, state.originalFetch ?? globalThis.fetch);
+						writeJson(res, 200, { ok: result.ok, key, via: 'direct', ...result });
+						return;
+					}
+					const dispatcher = pool.get(decision.url);
+					const result = await probeVia(probeUrl, dispatcher, state.originalFetch ?? globalThis.fetch);
+					writeJson(res, 200, { ok: result.ok, key, via: decision.name, ...result });
+				};
 				if (body.kind === 'proxy') {
 					let url = null;
 					try {
@@ -696,24 +891,34 @@ async function apply(ctx, config = {}) {
 					writeJson(res, 200, { ok: result.ok, key: String(body.name), ...result });
 					return;
 				}
+				if (body.kind === 'provider') {
+					const pid = String(body.key ?? '');
+					const providerDecision = state.providerDecisions.get(pid);
+					if (providerDecision !== undefined) {
+						await probeRoute(providerDecision, pid);
+						return;
+					}
+					const host = state.rows.find((r) => r.providerId === pid)?.host ?? '';
+					if (!host) {
+						writeJson(res, 200, { ok: false, key: pid, message: '未知提供商（不在模型目录中且未设置走向）' });
+						return;
+					}
+					await probeRoute(state.decide ? state.decide(host) : { kind: 'direct' }, pid);
+					return;
+				}
 				if (body.kind === 'model') {
 					const row = state.rows.find((r) => r.key === body.key);
 					if (!row) {
 						writeJson(res, 200, { ok: false, key: String(body.key ?? ''), message: '未知模型' });
 						return;
 					}
-					const decision = state.decide ? state.decide(row.host) : { kind: 'direct' };
-					if (decision.kind === 'direct') {
-						const result = await probeVia(probeUrl, null, state.originalFetch ?? globalThis.fetch);
-						writeJson(res, 200, { ok: result.ok, key: row.key, via: 'direct', ...result });
-						return;
-					}
-					const dispatcher = pool.get(decision.url);
-					const result = await probeVia(probeUrl, dispatcher, state.originalFetch ?? globalThis.fetch);
-					writeJson(res, 200, { ok: result.ok, key: row.key, via: decision.name, ...result });
+					const providerDecision = state.providerDecisions.get(row.providerId);
+					const decision = providerDecision !== undefined ? providerDecision
+						: (state.decide ? state.decide(row.host) : { kind: 'direct' });
+					await probeRoute(decision, row.key);
 					return;
 				}
-				writeJson(res, 400, { ok: false, code: 'bad-request', message: 'kind must be "proxy" or "model"' });
+				writeJson(res, 400, { ok: false, code: 'bad-request', message: 'kind must be "proxy", "provider" or "model"' });
 			},
 		});
 		routes.push({
@@ -728,12 +933,22 @@ async function apply(ctx, config = {}) {
 				try {
 					const text = (await readFile(configFile, 'utf8')).replace(/^\uFEFF/, '');
 					const parsed = JSON.parse(stripJsonComments(text));
-					// 整段写入 settings 的 user 层（覆盖式）
+					// 整段写入条目配置（覆盖式）；modelRoutes 迁移为 providerRoutes 前缀
+					const providerRoutes = parsed.providerRoutes && typeof parsed.providerRoutes === 'object' && !Array.isArray(parsed.providerRoutes)
+						? { ...parsed.providerRoutes }
+						: {};
+					for (const [key, via] of Object.entries(parsed.modelRoutes ?? {})) {
+						const slash = key.indexOf('/');
+						const pid = slash > 0 ? key.slice(0, slash) : '';
+						if (pid && providerRoutes[pid] === undefined) providerRoutes[pid] = via;
+					}
+					const singleProxy = typeof parsed.singleProxy === 'string' ? parsed.singleProxy
+						: (typeof parsed.proxy === 'string' ? parsed.proxy : '');
 					const ops = [
-						{ op: 'set', path: ['proxy'], value: typeof parsed.proxy === 'string' ? parsed.proxy : '' },
+						{ op: 'set', path: ['singleProxy'], value: singleProxy },
 						{ op: 'set', path: ['proxies'], value: parsed.proxies && typeof parsed.proxies === 'object' && !Array.isArray(parsed.proxies) ? parsed.proxies : {} },
 						{ op: 'set', path: ['default'], value: typeof parsed.default === 'string' ? parsed.default : 'direct' },
-						{ op: 'set', path: ['modelRoutes'], value: parsed.modelRoutes && typeof parsed.modelRoutes === 'object' && !Array.isArray(parsed.modelRoutes) ? parsed.modelRoutes : {} },
+						{ op: 'set', path: ['providerRoutes'], value: providerRoutes },
 						{ op: 'set', path: ['routes'], value: Array.isArray(parsed.routes) ? parsed.routes : [] },
 						{ op: 'set', path: ['logRequests'], value: parsed.logRequests !== false },
 					];
@@ -811,77 +1026,129 @@ async function apply(ctx, config = {}) {
 			});
 		});
 
-		// —— settings 模式（dsh 0.1.5 的 seam.register 通道；0.1.7+ 走不到）——
+		// —— settings：0.1.5 注册命名空间；0.1.7 用导出的 Config schema + describe/credentials ——
 		// 回调必须**同步**（Cordis 的 inject 回调返回后 runtime session 即释放，
 		// await 之后再调 sctx.effect 会炸）；所有动态 import 已在 apply 顶部完成，
 		// 目录刷新这类异步工作放进 timer / watch 回调，绝不触碰 sctx。
 		ctx.inject(['settings'], (sctx) => {
 			const seam = sctx?.settings;
-			if (!seam || typeof seam.register !== 'function') {
-				log.warn(`${TAG} settings seam 不可用（本版本由插件 Config schema 派生配置），配置仅来自条目/文件`);
+			if (!seam || typeof seam.describe !== 'function') {
+				log.warn(`${TAG} settings 服务不可用，配置仅来自条目/文件`);
 				return;
 			}
 			state.seam = seam;
-			const Config = makeConfigSchema();
-			if (!Config) {
-				log.warn(`${TAG} schemastery 不可用——settings 注册跳过，配置仅来自条目/文件`);
-				return;
-			}
-			try {
-				const scope = seam.register(NAMESPACE, Config, { base: config, applies: 'live' });
-				// provider 命名空间（llm-pi-ai / llm-deepseek）注册晚于本插件：
-				// 带退避重试直到模型目录可解析，并在 provider 文档变化时重编译。
-				const PROVIDER_NS = new Set(['llm-pi-ai', 'llm-deepseek']);
-				const providerReady = () => {
-					try {
-						return [...PROVIDER_NS].every((ns) => seam.describe({ redactSecrets: true }).some((d) => String(d.ns) === ns));
-					} catch {
-						return false;
-					}
-				};
-				const applySettings = (announce = false) => {
-					state.rows = listModels(seam);
-					if (state.mode === 'file') return; // 文件优先，settings 值不覆盖
-					rawSnapshotForRecompile = scope.get();
-					applyRawConfig(scope.get(), `设置页(${NAMESPACE})`, announce);
-				};
-				const timers = [];
-				const scheduleRetry = (attempt) => {
-					if (attempt > 8) return;
-					const timer = setTimeout(() => {
-						try {
-							applySettings(attempt === 0);
-						} catch (error) {
-							log.warn(`${TAG} settings 首次应用失败: ${error?.message ?? error}`);
-						}
-						if (!providerReady()) scheduleRetry(attempt + 1);
-					}, 100 * 2 ** attempt);
-					timers.push(timer);
-				};
+			const timers = [];
+			/** 凭据可能注册晚于本插件：退避重试直到密钥映射可建（或到次数上限）。 */
+			const scheduleKeyRetry = (attempt) => {
+				if (attempt > 6) return;
+				const timer = setTimeout(() => {
+					void rebuildKeyRoutes().then((ok) => {
+						if (!ok || state.keyRoutes.size === 0) scheduleKeyRetry(attempt + 1);
+					});
+				}, 200 * 2 ** attempt);
+				timers.push(timer);
+			};
+			void rebuildKeyRoutes().then((ok) => {
+				if (!ok || state.keyRoutes.size === 0) scheduleKeyRetry(0);
+			});
+			/** 从 describe 重读本插件条目配置（0.1.7 保存后的热生效路径）。 */
+			const applyEntryConfigFromSettings = () => {
+				if (state.mode !== 'settings') return; // 文件优先
 				try {
-					applySettings(true);
-				} catch (error) {
-					log.warn(`${TAG} settings 首次应用失败: ${error?.message ?? error}`);
-				}
-				if (!providerReady()) scheduleRetry(0);
-				const disposeWatch = scope.watch((next) => {
-					if (state.mode === 'file') return;
-					rawSnapshotForRecompile = next;
-					applyRawConfig(next, `设置页(${NAMESPACE})`, false);
-				});
-				const disposeDoc = ctx.on('settings/document-updated', (ns) => {
-					if (ns !== undefined && PROVIDER_NS.has(String(ns))) {
-						try { refreshCatalog(true); } catch { /* 重试 timer 兜底 */ }
+					const row = seam.describe().find((d) => String(d.ns) === NAMESPACE);
+					if (!row || row.value === null || typeof row.value !== 'object') return;
+					rawSnapshotForRecompile = row.value;
+					applyRawConfig(row.value, `条目配置(设置)`, false);
+				} catch { /* describe 失败时保留现值 */ }
+			};
+			let keyRebuildDebounce = null;
+			/** 文档更新（自己的保存 / provider 配置变化）→ 应用 + 目录 + 密钥映射。 */
+			const onDocumentUpdated = (ns) => {
+				if (ns === undefined || String(ns) === NAMESPACE) applyEntryConfigFromSettings();
+				try { refreshCatalog(false); } catch { /* ignore */ }
+				if (keyRebuildDebounce) clearTimeout(keyRebuildDebounce);
+				keyRebuildDebounce = setTimeout(() => {
+					keyRebuildDebounce = null;
+					void rebuildKeyRoutes();
+				}, 400);
+				timers.push(keyRebuildDebounce);
+			};
+			if (typeof seam.register === 'function') {
+				// —— dsh 0.1.5：注册 namespace（写入 settings.yaml 的 proxy-routes 段）——
+				const registerSchema = makeRegisterSchema();
+				try {
+					const scope = seam.register(NAMESPACE, registerSchema, { base: config, applies: 'live' });
+					// provider 命名空间（llm-pi-ai / llm-deepseek）注册晚于本插件：
+					// 带退避重试直到模型目录可解析，并在 provider 文档变化时重编译。
+					const PROVIDER_NS = new Set(['llm-pi-ai', 'llm-deepseek']);
+					const providerReady = () => {
+						try {
+							return [...PROVIDER_NS].every((ns) => seam.describe({ redactSecrets: true }).some((d) => String(d.ns) === ns));
+						} catch {
+							return false;
+						}
+					};
+					const applySettings = (announce = false) => {
+						state.rows = listModels(seam);
+						if (state.mode === 'file') return; // 文件优先，settings 值不覆盖
+						rawSnapshotForRecompile = scope.get();
+						applyRawConfig(scope.get(), `设置页(${NAMESPACE})`, announce);
+					};
+					const scheduleRetry = (attempt) => {
+						if (attempt > 8) return;
+						const timer = setTimeout(() => {
+							try {
+								applySettings(attempt === 0);
+							} catch (error) {
+								log.warn(`${TAG} settings 首次应用失败: ${error?.message ?? error}`);
+							}
+							if (!providerReady()) scheduleRetry(attempt + 1);
+						}, 100 * 2 ** attempt);
+						timers.push(timer);
+					};
+					try {
+						applySettings(true);
+					} catch (error) {
+						log.warn(`${TAG} settings 首次应用失败: ${error?.message ?? error}`);
 					}
-				});
-				log.info(`${TAG} settings 命名空间 "${NAMESPACE}" 已注册 —— 设置 → 插件 → 代理路由 实时生效${state.mode === 'file' ? '（当前配置文件模式优先，可在卡片中一键迁移）' : ''}`);
+					if (!providerReady()) scheduleRetry(0);
+					const disposeWatch = scope.watch((next) => {
+						if (state.mode === 'file') return;
+						rawSnapshotForRecompile = next;
+						applyRawConfig(next, `设置页(${NAMESPACE})`, false);
+					});
+					const disposeDoc = ctx.on('settings/document-updated', onDocumentUpdated);
+					log.info(`${TAG} settings 命名空间 "${NAMESPACE}" 已注册 —— 设置 → 插件 → 代理路由 实时生效${state.mode === 'file' ? '（当前配置文件模式优先，可在卡片中一键迁移）' : ''}`);
+					sctx.effect(() => () => {
+						disposeWatch();
+						disposeDoc();
+						for (const timer of timers) clearTimeout(timer);
+					});
+				} catch (error) {
+					log.error(`${TAG} settings 注册失败，配置仅来自条目/文件: ${error?.message ?? error}`);
+				}
+			} else {
+				// —— dsh 0.1.7+：无 register()；配置从导出的 Config schema 派生，
+				//    卡片保存走 SettingsForms.mutate（同一 op 协议），目录与密钥经
+				//    describe + credentials 获取。条目配置初始值已在 apply 里生效。
+				log.info(`${TAG} dsh 0.1.7+ settings（Config schema 派生）：条目配置 + describe 目录 + credentials 密钥映射已启用`);
+				if (state.mode === 'settings') {
+					applyEntryConfigFromSettings();
+					if (state.cfg === null) {
+						// describe 里还没有本条目行时（时序兜底）：直接用 apply 收到的条目配置
+						rawSnapshotForRecompile = config;
+						applyRawConfig(config, '条目配置', true);
+					}
+					// 提供商/模型目录（卡片的 providers 列表 + 测试按钮需要 host）
+					try { refreshCatalog(false); } catch { /* ignore */ }
+				} else {
+					try { refreshCatalog(true); } catch { /* ignore */ }
+				}
+				const disposeDoc = ctx.on('settings/document-updated', onDocumentUpdated);
 				sctx.effect(() => () => {
-					disposeWatch();
 					disposeDoc();
 					for (const timer of timers) clearTimeout(timer);
 				});
-			} catch (error) {
-				log.error(`${TAG} settings 注册失败，配置仅来自条目/文件: ${error?.message ?? error}`);
 			}
 		});
 	} else {

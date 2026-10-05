@@ -1,13 +1,12 @@
-// dsh-proxy-routes — 模型目录：把「按模型设置代理」的意图编译成 host 级路由。
+// dsh-proxy-routes — 模型目录：列出各提供商（账号）与其模型。
 //
-// DSH 的 LLM 流量最终落到 globalThis.fetch，fetch 层只能看到目标 URL——因此
-// 「模型 → 代理」在传输层的实现语义是「模型 → 其 provider 的 baseURL host → 代理」。
-// 同一 host 下的所有模型共享同一路由（与官方模型选择器的 host 解析一致，也是
-// dsh-llm-proxy 的既有语义）；编译时发现冲突（同 host 的模型被分到不同代理）会
-// 返回冲突清单，由设置页卡片按 host 分组展示并提示。
+// DSH 的 LLM 流量最终落到 globalThis.fetch；v0.4 起路由按「提供商（账号）」
+// 分流——每个请求的密钥头在 fetch 层识别提供商，因此这里只需要给出
+// providerId → host 的目录事实（供设置页展示与测试按钮使用）。
 //
 // 目录来源（与官方模型选择器对齐）：
 //   1. settings 的 `llm-pi-ai.providers.<id>`：baseURL + 显式 models
+//      （dsh 0.1.7 起条目 id 可能不同——按 providers 形态识别，不硬编码 ns）
 //   2. provider 未写 models 时回退 pi-ai 内置目录（@earendil-works/pi-ai）
 //   3. `llm-deepseek` 官方命名空间（https://api.deepseek.com）
 
@@ -59,7 +58,7 @@ function hostOf(baseURL) {
 }
 
 /**
- * 列出全部可选模型（设置页卡片的模型列表）。
+ * 列出全部可选模型（设置页卡片的提供商/模型列表）。
  * @param {import('@deepseek-ai/dsh-settings').Settings} settings host settings seam
  * @returns {{key: string, providerId: string, modelId: string, name: string,
  *            providerLabel: string, host: string}[]} 按 provider 分组的模型行
@@ -72,9 +71,15 @@ export function listModels(settings) {
 			const ns = String(descriptor.ns);
 			const value = descriptor.value;
 			if (typeof value !== 'object' || value === null) continue;
-			if (ns === 'llm-pi-ai' && typeof value.providers === 'object' && value.providers !== null) {
-				for (const [providerId, profile] of Object.entries(value.providers)) {
-					if (typeof profile !== 'object' || profile === null) continue;
+			// pi-ai 形态：providers 字典。0.1.5 的 ns 固定为 'llm-pi-ai'；0.1.7
+			// 起为条目 id（可能不同）——按 profile 形态识别，避免硬编码。
+			if (typeof value.providers === 'object' && value.providers !== null && !Array.isArray(value.providers)) {
+				const profiles = Object.entries(value.providers).filter(([, profile]) =>
+					profile !== null && typeof profile === 'object'
+					&& (typeof profile.baseURL === 'string' || Array.isArray(profile.models)
+						|| typeof profile.apiKeyEnv === 'string' || typeof profile.apiKey === 'string'));
+				if (profiles.length === 0) continue;
+				for (const [providerId, profile] of profiles) {
 					const host = hostOf(typeof profile.baseURL === 'string' ? profile.baseURL : '');
 					const providerLabel = typeof profile.displayName === 'string' && profile.displayName.length > 0
 						? profile.displayName
@@ -97,7 +102,7 @@ export function listModels(settings) {
 						});
 					}
 				}
-			} else if (ns === 'llm-deepseek' && typeof value.models === 'object' && value.models !== null) {
+			} else if (ns.includes('deepseek') && typeof value.models === 'object' && value.models !== null) {
 				// 官方 DeepSeek：host 固定 api.deepseek.com；models 是对象还是数组
 				// 取决于版本，两种都容忍
 				const models = Array.isArray(value.models) ? value.models : Object.values(value.models);
@@ -117,36 +122,4 @@ export function listModels(settings) {
 		}
 	} catch { /* settings 不可用时返回已收集的部分 */ }
 	return rows;
-}
-
-/**
- * 把 `modelRoutes`（modelKey → via）编译成 host → via 的路由表。
- * 同一 host 的模型必须共享同一路由：冲突时后配置的胜出，并把冲突写进返回的
- * conflicts 列表（设置页据此提示用户「同域名模型共享路由」）。
- * @param {ReturnType<typeof listModels>} rows listModels 的输出
- * @param {Record<string, string>} modelRoutes modelKey → via（'direct' | 代理名 | 'proxy'）
- * @returns {{hostRoutes: Map<string, string>, conflicts: string[]}}
- */
-export function compileModelRoutes(rows, modelRoutes) {
-	const selected = new Map(Object.entries(modelRoutes ?? {}));
-	const hostRoutes = new Map();
-	const conflicts = [];
-	const owner = new Map(); // host -> 首个赋予它路由的模型 key
-	for (const row of rows) {
-		const via = selected.get(row.key);
-		if (via === undefined) continue;
-		const priorVia = hostRoutes.get(row.host);
-		if (priorVia === undefined) {
-			hostRoutes.set(row.host, via);
-			owner.set(row.host, row.key);
-		} else if (priorVia !== via) {
-			conflicts.push(`${row.key} 与 ${owner.get(row.host)} 同域名 ${row.host}，路由取 ${via}`);
-			hostRoutes.set(row.host, via);
-		}
-	}
-	// 未知模型 key（目录里没有）：忽略但记录
-	for (const key of selected.keys()) {
-		if (!rows.some((row) => row.key === key)) conflicts.push(`${key} 不在当前模型目录中，已忽略`);
-	}
-	return { hostRoutes, conflicts };
 }

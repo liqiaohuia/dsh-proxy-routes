@@ -1,32 +1,36 @@
-# dsh-proxy-routes —— DSH 代理路由：按模型 / 按域名分流 + 代理池 + 设置页配置
+# dsh-proxy-routes —— DSH 代理路由：按提供商（账号）/ 按域名分流 + 代理池 + 设置页配置
 
 给 DSH（DeepSeek Harness）装的 Cordis 插件：拦截本进程内所有 `fetch` 请求，按
-**模型**或**域名**决定走**代理池中的哪个代理**还是**直连**。传输层复用 DSH
-自带的 undici（零 npm 依赖），配置在 **DSH 设置页**图形化管理，保存即热生效。
+**提供商（账号）**或**域名**决定走**代理池中的哪个代理**还是**直连**。传输层复用
+DSH 自带的 undici（零 npm 依赖），配置在 **DSH 设置页**图形化管理，保存即热生效。
 
 解决什么问题：Anthropic / NVIDIA NIM 等海外 API 对中国大陆 IP 返回 403（DSH
 界面误显示为 "API key is invalid"），而智谱/DeepSeek 等国内 API 又不该绕道代理；
-手上往往还有不止一个代理（主备、不同出口）。本插件让每个模型、每类流量各走各的路。
+手上往往还有不止一个代理（主备、不同出口）。本插件让每个**账号**、每类流量各走
+各的路——尤其是**同一服务商的多个账号**（免费额度走代理、主力付费账号直连），
+域名规则做不到这一点，按密钥识别的提供商路由可以。
 
-**兼容性**：与 DSH 0.1.5-rc.2 / DSH Desktop 2.0.13 实测兼容（Cordis 4.0.2
-函数式插件、`dsh plugin add` 自动登记 bundle 层、settings 命名空间与设置页
-卡片机制均验证通过）。传输层要求 DSH ≥ 0.1.3（自带 undici ≥ 7.10，含
-Socks5ProxyAgent）。
+**兼容性**：DSH Desktop 2.0.14（dsh 0.1.7，settings 从插件 Config schema 派生）
+与 2.0.13（dsh 0.1.5-rc.2，settings 命名空间）双代实测兼容。传输层要求
+DSH ≥ 0.1.3（自带 undici ≥ 7.10，含 Socks5ProxyAgent）。
 
-## v0.3 新特性
+## v0.4 新特性
 
+- **按提供商（账号）分流**：每个请求按其**API 密钥**识别属于哪个提供商——
+  同一域名下的 claude1 / claude2 两个账号可各走各的代理或直连。密钥只在
+  内存中匹配（经 credentials 服务 / 环境变量解析），绝不写日志
+- **DSH 2.0.14（dsh 0.1.7）适配**：导出带 `volatile` 字段的 Config schema，
+  官方设置机制从它派生条目表单；卡片保存走 `SettingsForms.mutate`（与官方
+  同一 op 协议）；旧版「按模型」的 `modelRoutes` 自动迁移为按提供商
 - **配置卡片**（双协议注册，两个桌面版代次都能找到）：
-  - **DSH Desktop 2.0.14+**：侧栏 **插件页（Plugins）→ 已装插件的配置区 / 详情** ——
-    卡片注册进官方 `plugins.item` 槽（详情页 summary 一行简介 + page 完整编辑卡）
-  - **DSH Desktop 2.0.13**：设置 → 插件 → **代理路由**（`settings.plugin.item` keyed 槽）
-  - 代理池增删改、按模型选代理、域名规则、默认走向、每行「测试连接」按钮，
-    保存即热生效（官方 settings 机制，写入 settings.yaml 的 `proxy-routes` 命名空间）
+  - **DSH Desktop 2.0.14+**：侧栏 **插件页**详情 + **设置 → 代理路由** 独立页
+  - **DSH Desktop 2.0.13**：设置 → 插件 → **代理路由**
+  - 代理池增删改、按提供商选代理、域名规则、默认走向、每行「测试连接」按钮
 - **代理池**：多个命名代理（`proxies`），每条规则按名字引用；SOCKS5 / HTTP
   CONNECT / 代理端 TLS（https://）三种协议混用
-- **按模型设置**：`"providerId/modelId" → 代理`；模型列表自动读取 DSH 已配置的
-  LLM provider（含官方 DeepSeek 与 pi-ai 内置目录兜底），按 provider 分组展示
 - **文件模式兼容**：v0.2 的 `$DSH_HOME/proxy-routes.jsonc` 存在时继续生效，
-  卡片显示「迁移到设置页」按钮一键搬家（原文件保留 `.bak`）
+  卡片显示「迁移到设置页」按钮一键搬家（原文件保留 `.bak`）；文件模式下
+  编辑控件置灰只读（测试按钮仍可用）
 
 ## 安装
 
@@ -80,24 +84,28 @@ dsh plugin --profile web add https://github.com/<you>/dsh-proxy-routes.git
 2. **代理池**：给每个代理起名并填地址（例 `main` = `socks5://127.0.0.1:50939`），
    点「测试」确认可达（探测默认访问 `https://www.gstatic.com/generate_204`，
    可在「其他选项」里改）
-3. **按模型设置**：模型列表按 provider 分组（数据来自 DSH 已配置的 LLM
-   provider），每行下拉选择 直连 / 单代理 / 池中某个代理；点「测试」走该模型
-   当前的真实路由探测
+3. **按提供商（账号）分流**：提供商列表自动来自 DSH「模型」页配置的 LLM 账号
+   （claude1、claude2、nvidia-01…），每行下拉选择 直连 / 按域名规则 / 池中某个
+   代理；点「测试」走该提供商当前的真实路由探测
 4. **默认走向**：没命中任何规则的域名走哪条路（建议 `direct`——新域名不绕代理）
-5. **保存**：写入 settings.yaml，立即生效；真实 LLM 请求发生时在日志里可见
-   `POST api.anthropic.com/v1/messages -> main:socks5://127.0.0.1:50939`
+5. **保存**：立即生效；真实 LLM 请求发生时在日志里可见
+   `POST api.anthropic.com/v1/messages -> claude1=>main:socks5://127.0.0.1:50939`
 
-### 按模型 = 按 API 域名（诚实语义）
+### 按提供商 = 按账号（为什么按域名做不到）
 
-传输层只能看到请求 URL，因此「按模型」的实际生效粒度是**该模型 provider 的
-API 域名**：同一域名下的模型共享同一路由（卡片按域名分组并提示，冲突时以最后
-一行为准）。这正是 DSH 官方模型选择器解析模型的同一口径。
+同一服务商的多个账号打向**同一个 API 域名**，域名规则在传输层无法区分它们。
+本插件利用的事实是：DSH（llm-pi-ai）发出的每个 LLM 请求都带着**该账号的 API
+密钥头**（`x-api-key` / `authorization: Bearer`）——插件在 fetch 层提取密钥、
+匹配「密钥 → 提供商」映射（启动时经 settings `describe` + credentials 服务
+解析，密钥只进内存），即可精确判断这次请求属于哪个账号。典型用法：
 
-**变通**：需要「同一 API 服务、两个模型、不同出口」时——比如 10 个模型同在
-`https://api.example.com`——把它建成**两个 provider 条目**，baseURL 一个写
-`https://api.example.com`、另一个显式写 `https://api.example.com:443`（网络
-等价），再把各自模型分到不同代理。本插件的域名规则匹配区分 `host:port`，
-能同时容纳这两种写法。
+- `claude1`（免费额度、限每分钟次数）→ 走代理
+- `claude2`（付费主力）→ 显式 `direct`，不受域名规则影响
+- 未列出的账号 → 按域名规则 / 默认走向
+
+优先级：**提供商显式走向 > 域名规则 > 默认走向**。提供商设为 `direct` 会强制
+直连（无视域名规则）。旧版 `modelRoutes`（`"providerId/modelId"` 前缀）读取时
+自动迁移为按提供商。
 
 ## 配置
 
@@ -116,13 +124,15 @@ API 域名**：同一域名下的模型共享同一路由（卡片按域名分�
     "secure": "https://127.0.0.1:7891"      // 代理端 TLS
   },
   // 单代理（v0.2 兼容），等价于池里名为 "default" 的一项；via 可写 "proxy" 引用它
-  "proxy": "",
+  "singleProxy": "",
   // 默认走向："direct" | "proxy" | 代理名
   "default": "direct",
-  // 按模型："providerId/modelId" → "direct" | "proxy" | 代理名（按 provider 的 API 域名生效）
-  "modelRoutes": {
-    "nvidia-01/z-ai/glm-5.3": "main",
-    "deepseek-official/deepseek-chat": "direct"
+  // 按提供商（账号）："providerId" → "direct" | "proxy" | 代理名。
+  // 提供商 id 即 DSH「模型」页里各账号的提供商 ID；按请求密钥识别，同域可分流
+  "providerRoutes": {
+    "claude1": "main",
+    "claude2": "direct",
+    "nvidia-01": "backup"
   },
   // 按域名（含所有子域名），从上到下第一条命中生效
   "routes": [
@@ -136,29 +146,32 @@ API 域名**：同一域名下的模型共享同一路由（卡片按域名分�
 }
 ```
 
-- 域名写裸域名自动覆盖子域名（`anthropic.com` 匹配 `api.anthropic.com`）；
-  写 `host:443` 则精确匹配该端口（见上文「变通」）
-- 模型路由优先于域名规则：`modelRoutes` 编译出的 host 规则先匹配，其次
-  `routes`，最后 `default`
+- 域名写裸域名自动覆盖子域名（`anthropic.com` 匹配 `api.anthropic.com`）
+- 提供商显式走向优先于域名规则，其次 `routes`，最后 `default`；提供商设为
+  `direct` 强制直连
 - 代理名不存在时该规则回退直连并在日志警告；语法/结构错误时保留上一份配置
 
 ## 工作原理
 
-1. 启动时通过 DSH settings 机制注册 `proxy-routes` 命名空间（`applies: 'live'`，
-   官方 schema 校验/持久化/热生效），并从 `llm-pi-ai` / `llm-deepseek` 命名空间
-   读取模型目录（provider 未写 models 时回退 pi-ai 内置目录——与官方模型
-   选择器同源）
-2. 把 `modelRoutes`（模型 → 代理）编译成 host 级路由表；替换
-   `globalThis.fetch`：每个请求查表（模型 host 规则 → 域名规则 → default）
-3. 命中代理的请求交给 DSH 自带的 undici（`undici.fetch` + 按代理协议构建的
+1. **配置**：dsh 0.1.7（Desktop 2.0.14）从插件导出的 **Config schema**（volatile
+   字段）派生条目配置，官方设置表单与卡片保存（`SettingsForms.mutate`，同一
+   op 协议）都落到条目配置；dsh 0.1.5（2.0.13）则注册 `proxy-routes` 命名空间。
+   `$DSH_HOME/proxy-routes.jsonc` 存在时文件优先
+2. **密钥 → 提供商映射**：settings `describe`（未脱敏，仅内存）读到各提供商的
+   `apiKeyEnv` 凭据引用，经 credentials 服务（或环境变量）解析成密钥，建立
+   密钥 → 提供商映射；provider 配置变化时自动重建。**密钥绝不写日志**
+3. **fetch 拦截**：替换 `globalThis.fetch`：每个请求提取 `x-api-key` /
+   `authorization: Bearer` 密钥 → 命中提供商 → 该账号的显式走向；未命中再走
+   域名规则 → 默认走向
+4. 命中代理的请求交给 DSH 自带的 undici（`undici.fetch` + 按代理协议构建的
    `Socks5ProxyAgent` / `ProxyAgent` per-request dispatcher，按代理 URL 池化
    复用）——SOCKS5 隧道、HTTP CONNECT、TLS、压缩、重定向跟随、SSE 流式都是
    undici 原生实现；**不触碰 undici 全局 dispatcher**
-4. 设置页卡片经本机回环同源桥接（`/api/dsh-proxy-routes/settings/*`，
-   loopback + 同源 + Host 校验）读写命名空间、列模型、跑测试——第三方
-   namespace 不在 DSH apiproxy 的白名单里，此桥接为官方机制的标准补位
+5. 设置页卡片经本机回环同源桥接（`/api/dsh-proxy-routes/settings/*`，
+   loopback + 同源 + Host 校验）读写配置、列提供商、跑测试——第三方 namespace
+   不在 DSH apiproxy 的白名单里，此桥接为官方机制的标准补位
    （dshmarket / dsh-llm-proxy 同模式）
-5. 路由判断抛错时兜底直连，插件自身绝不导致请求失败
+6. 路由判断抛错时兜底直连，插件自身绝不导致请求失败
 
 ### 与官方出站代理（`dsh-http-proxy`）及 dsh-llm-proxy 的关系
 
@@ -168,7 +181,7 @@ API 域名**：同一域名下的模型共享同一路由（卡片按域名分�
 | 默认语义 | **默认直连**，命中才代理 | 默认全代理，排除列表直连 | 默认直连，选中模型代理 |
 | SOCKS5（含认证） | ✓ 原生 | ✗ 明确拒绝 | ✓（有官方包时复用其传输层） |
 | 多代理池、每规则选不同代理 | ✓（v0.3） | ✗ 单一出口 | ✗ 单一出口 |
-| 按模型选择 | ✓（host 粒度） | ✗ | ✓（host 粒度） |
+| 按提供商（账号）分流（同域多账号） | ✓（v0.4，按密钥） | ✗ | ✗（host 粒度） |
 | 覆盖范围 | 进程内全部 fetch（模型、web fetch、MCP…） | 进程内全部流量 + 子进程环境 | 同官方范围 |
 | 与其他代理机制 | fetch 层拦截，互不抢占 | 替换全局 dispatcher | 复用官方全局 dispatcher |
 
@@ -183,19 +196,21 @@ dispatcher，未命中的才落到全局 dispatcher（官方策略）。
   `%APPDATA%/DSH Desktop/logs/host/dsh-<日期>.log`（Windows）。启动时一行：
 
   ```
-  [proxy-routes] 配置已加载 设置页(proxy-routes)（代理池=[main,backup]，默认=直连，域名规则[anthropic.com,claude.ai=>main；…]，模型路由 2 条，来源=设置页）
-  [proxy-routes] settings 命名空间 "proxy-routes" 已注册 —— 设置 → 插件 → 代理路由 实时生效
+  [proxy-routes] 配置已加载 设置页(proxy-routes)（代理池=[main,backup]，默认=直连，域名规则[anthropic.com,claude.ai=>main；…]，提供商路由[claude1=>代理,claude2=>直连]，来源=设置页）
+  [proxy-routes] 密钥→提供商映射已建立：2 条（提供商 claude1, claude2）
   [proxy-routes] 设置桥接已挂载 /api/dsh-proxy-routes/settings（5 条路由）
   ```
 
-  每个走代理的请求再打一行（`logRequests: false` 可关闭）：
+  每个走代理的请求再打一行（`logRequests: false` 可关闭；提供商命中的行带
+  账号名，**绝不含密钥**）：
 
   ```
-  [proxy-routes] POST api.anthropic.com/v1/messages -> main:socks5://127.0.0.1:50939
+  [proxy-routes] POST api.anthropic.com/v1/messages -> claude1=>main:socks5://127.0.0.1:50939
   ```
 
-- 模型目录冷启动时序：`llm-pi-ai` / `llm-deepseek` 注册晚于本插件，插件会带
-  退避重试直到模型目录可解析，provider 配置变化（如改 baseURL）也会触发重编译
+- 提供商目录与密钥映射的冷启动时序：`llm-pi-ai` 等条目注册晚于本插件，插件会
+  带退避重试直到密钥映射与模型目录可解析；provider 配置变化（如改 baseURL /
+  换账号密钥）也会自动触发重建
 
 ## 发布与上架市场
 

@@ -1,6 +1,8 @@
-// dsh-proxy-routes —— v0.3 测试脚本（无依赖，直接 node 运行）。
+// dsh-proxy-routes —— v0.4 测试脚本（无依赖，直接 node 运行）。
 // 覆盖：require 兼容回归（防桌面版 invalid plugin 事故）/ 文件模式加载 /
-// 双代理池路由 / 直连 / 模型路由编译（单元）/ normalizeProxyUrl 归一化（单元）/
+// 双代理池路由 / 直连 / Config schema 导出（0.1.7 volatile 标记）/
+// 0.1.7 settings 模式（无 register）+ 按提供商（密钥）分流——同域双账号
+// 各走各路的端到端回归 / 密钥不落日志（安全规则）/ normalizeProxyUrl（单元）/
 // dispatcher 池缓存（单元）/ 热重载 / 卸载还原。
 //
 // 运行：node test-plugin.mjs
@@ -44,7 +46,6 @@ try {
 
 const { apply } = await import('./index.mjs');
 const { normalizeProxyUrl, DispatcherPool } = await import('./transport.mjs');
-const { compileModelRoutes } = await import('./catalog.mjs');
 
 /* —— mock Cordis 上下文（无 inject → 文件模式直接生效）—— */
 const logs = [];
@@ -144,18 +145,113 @@ try {
 	pool.close();
 }
 
-/* —— 9. 单元：compileModelRoutes —— */
+/* —— 9. 单元：导出的 Config schema（0.1.7 从它派生条目表单；写入只接受 volatile 字段）—— */
 {
-	const rows = [
-		{ key: 'p1/m1', host: 'a.example.com' },
-		{ key: 'p1/m2', host: 'a.example.com' },
-		{ key: 'p2/m1', host: 'b.example.com' },
-	];
-	const { hostRoutes, conflicts } = compileModelRoutes(rows, { 'p1/m1': 'main', 'p1/m2': 'backup', 'p2/m1': 'direct', 'p9/m9': 'x' });
-	check('模型路由：同 host 冲突时后者胜出', hostRoutes.get('a.example.com') === 'backup');
-	check('模型路由：direct 显式生效', hostRoutes.get('b.example.com') === 'direct');
-	check('模型路由：未知 key 记入 conflicts', conflicts.some((c) => c.includes('p9/m9')));
-	check('模型路由：host 冲突记入 conflicts', conflicts.some((c) => c.includes('同域名')));
+	const require_ = createRequire(import.meta.url);
+	const plugin = require_('./index.mjs');
+	const schema = plugin.Config;
+	check('Config schema 导出（0.1.7 settings 派生依赖）', Boolean(schema) && schema.type === 'object');
+	check('Config schema：proxies / providerRoutes / routes 为 volatile dict/list',
+		schema?.dict?.proxies?.meta?.volatile === true
+		&& schema?.dict?.providerRoutes?.meta?.volatile === true
+		&& schema?.dict?.routes?.meta?.volatile === true);
+	check('Config schema：configFile / trustedOrigins 非 volatile（改它们应重挂载）',
+		!schema?.dict?.configFile?.meta?.volatile && !schema?.dict?.trustedOrigins?.meta?.volatile);
+}
+
+/* —— 9b. 集成：0.1.7 settings 模式（seam 无 register）+ 按提供商（密钥）分流 ——
+   同一 api.anthropic.com 的两个账号：claude1 走 main(50939) 得 401，claude2 显式
+   direct 得 403，无密钥请求落默认走向——「同域多账号各走各路」的端到端回归；
+   并断言密钥绝不落日志（安全规则回归）。 */
+{
+	const KEY1 = 'sk-test-claude1-dpr', KEY2 = 'sk-test-claude2-dpr';
+	process.env.DPR_TEST_K1 = KEY1;
+	process.env.DPR_TEST_K2 = KEY2;
+	const HOME2 = mkdtempSync(join(tmpdir(), 'dsh-proxy-test2-'));
+	const previousHome = process.env.DSH_HOME;
+	process.env.DSH_HOME = HOME2; // 无配置文件 → settings 模式
+
+	const webRoutes = [];
+	const settingsRows = () => ([
+		{
+			ns: 'proxy-routes',
+			value: {
+				proxies: { main: 'socks5://127.0.0.1:50939' },
+				providerRoutes: { claude1: 'main', claude2: 'direct' },
+				default: 'direct',
+				logRequests: true,
+			},
+		},
+		{
+			ns: 'llm-pi-ai',
+			value: {
+				providers: {
+					claude1: { apiKeyEnv: 'DPR_TEST_K1', baseURL: 'https://api.anthropic.com', displayName: 'Claude #1', models: [{ id: 'claude-x', name: 'Claude X' }] },
+					claude2: { apiKeyEnv: 'DPR_TEST_K2', baseURL: 'https://api.anthropic.com', displayName: 'Claude #2', models: [{ id: 'claude-y', name: 'Claude Y' }] },
+				},
+			},
+		},
+	]);
+	const fakeSeam = { describe: () => settingsRows(), mutate: async () => { throw new Error('test seam: mutate not expected'); } };
+	const dispose2 = [];
+	const ctx2 = {
+		effect: (fn) => { const d = fn(); dispose2.push(d); return d; },
+		on: () => () => {},
+		get: () => undefined, // credentials 服务不可用 → process.env 兜底
+		inject: (deps, cb) => {
+			const child = {
+				effect: (fn) => { const d = fn(); dispose2.push(d); return d; },
+				settings: fakeSeam,
+				webServer: { register: (route) => { webRoutes.push(route); return () => {}; } },
+			};
+			cb(child);
+			return child;
+		},
+		logger: ctx.logger,
+	};
+
+	await apply(ctx2, {});
+	await delay(300); // rebuildKeyRoutes 异步完成
+	check('0.1.7 settings（无 register）：桥接 5 条路由已挂载', webRoutes.filter((r) => r.kind === 'exact').length === 5);
+
+	let r1 = null, r2 = null, r3 = null;
+	try { r1 = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY1, 'content-type': 'application/json' }, body: '{}' }); }
+	catch (e) { console.log('  claude1: ' + (e.cause?.message ?? e.message)); }
+	check('同域双账号：claude1 经 main(50939) -> 401', r1 !== null && r1.status === 401);
+	try { r2 = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY2, 'content-type': 'application/json' }, body: '{}' }); }
+	catch (e) { console.log('  claude2: ' + (e.cause?.message ?? e.message)); }
+	check('同域双账号：claude2 显式直连 -> 403（同一 URL 仅密钥不同）', r2 !== null && r2.status === 403);
+	try { r3 = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }); }
+	catch (e) { console.log('  nokey: ' + (e.cause?.message ?? e.message)); }
+	check('无密钥请求：未命中提供商 → 默认直连 403', r3 !== null && r3.status === 403);
+	check('路由日志：claude1=>main（提供商名入日志）', logs.some((l) => l.includes('claude1=>main:socks5://127.0.0.1:50939')));
+	check('安全回归：密钥值绝不落日志', !logs.some((l) => l.includes(KEY1) || l.includes(KEY2)));
+
+	// bridge describe：providers 行（hasKey + host），且不含密钥本体
+	const describeRoute = webRoutes.find((r) => r.path.endsWith('/describe'));
+	if (describeRoute) {
+		const resMock = { statusCode: null, body: '', writeHead(code) { this.statusCode = code; }, end(b) { this.body = String(b); } };
+		await describeRoute.handler(
+			{ socket: { remoteAddress: '127.0.0.1' }, headers: { host: '127.0.0.1:43120' }, on: () => {} },
+			resMock,
+		);
+		let described = null;
+		try { described = JSON.parse(resMock.body); } catch { /* ignore */ }
+		const providers = described?.value?.providers ?? [];
+		check('bridge describe：providers 含 claude1/claude2（hasKey + host）',
+			providers.length === 2
+			&& providers.every((p) => p.hasKey === true && p.host === 'api.anthropic.com' && typeof p.id === 'string'));
+		check('bridge describe：不含密钥本体', !resMock.body.includes(KEY1) && !resMock.body.includes(KEY2));
+		check('bridge describe：settingsAvailable 标记', described?.value?.settingsAvailable === true);
+	} else {
+		check('bridge describe 路由存在', false);
+	}
+
+	for (const d of dispose2.splice(0)) { try { d?.(); } catch { /* ignore */ } }
+	delete process.env.DPR_TEST_K1;
+	delete process.env.DPR_TEST_K2;
+	process.env.DSH_HOME = previousHome;
+	rmSync(HOME2, { recursive: true, force: true });
 }
 
 /* —— 10. 浏览器端 client 模块形态回归（v0.3.1.1 事故）——
