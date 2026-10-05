@@ -589,8 +589,9 @@ async function apply(ctx, config = {}) {
 		req.on('error', () => resolve(undefined));
 	});
 
-	/** 构造 bridge 的全部路由（settings seam 可用后调用）。 */
-	const makeBridgeRoutes = (seam, opts) => {
+	/** 构造 bridge 的全部路由（不依赖 settings seam：0.1.7 的 settings 服务
+	 *  没有 register()，卡片与探测在文件/条目配置模式下也必须可用）。 */
+	const makeBridgeRoutes = (opts) => {
 		const guard = makeGuard(opts.trustedOrigins);
 		const writeJson = (res, status, payload) => {
 			res.writeHead(status, { 'content-type': 'application/json' });
@@ -602,6 +603,7 @@ async function apply(ctx, config = {}) {
 			value: {
 				mode: state.mode,
 				configFile: state.mode === 'file' ? configFile : null,
+				settingsAvailable: Boolean(state.seam && typeof state.seam.mutate === 'function'),
 				proxies: Object.fromEntries([...state.cfg?.proxies.entries() ?? []].map(([n, u]) => [n, u.href])),
 				singleProxy: state.cfg?.singleProxy?.href ?? null,
 				default: state.cfg?.defaultVia ?? 'direct',
@@ -612,6 +614,14 @@ async function apply(ctx, config = {}) {
 				rows: state.rows.map((row) => ({ ...row })),
 			},
 		});
+		/** 0.1.7+ 的 settings 从插件 Config schema 派生，没有 register()/mutate
+		 *  通道 —— 保存/迁移给出可操作的错误而不是 404/静默。 */
+		const requireSeam = (res) => {
+			const seam = state.seam;
+			if (seam && typeof seam.mutate === 'function') return seam;
+			writeJson(res, 200, { ok: false, code: 'settings-unavailable', message: '本版本 DSH 的设置由插件 Config schema 派生（无 settings 注册通道）；请使用配置文件或条目 config' });
+			return null;
+		};
 		const routes = [];
 		routes.push({
 			kind: 'exact',
@@ -635,6 +645,8 @@ async function apply(ctx, config = {}) {
 					writeJson(res, 409, { ok: false, code: 'file-mode', message: `配置文件 ${configFile} 优先于设置页；请先迁移或删除该文件` });
 					return;
 				}
+				const seam = requireSeam(res);
+				if (!seam) return;
 				try {
 					const result = await seam.mutate(NAMESPACE, body.ops, typeof body.expectedRevision === 'number' ? body.expectedRevision : undefined);
 					writeJson(res, 200, { ok: true, value: result });
@@ -725,6 +737,8 @@ async function apply(ctx, config = {}) {
 						{ op: 'set', path: ['routes'], value: Array.isArray(parsed.routes) ? parsed.routes : [] },
 						{ op: 'set', path: ['logRequests'], value: parsed.logRequests !== false },
 					];
+					const seam = requireSeam(res);
+					if (!seam) return;
 					await seam.mutate(NAMESPACE, ops);
 					await rename(configFile, `${configFile}.bak`);
 					writeJson(res, 200, { ok: true, value: { migrated: true, backup: `${configFile}.bak` } });
@@ -782,14 +796,29 @@ async function apply(ctx, config = {}) {
 	}
 
 	if (typeof ctx?.inject === 'function') {
-		// —— settings 模式：注册 namespace + 热生效 + bridge ——
+		// —— bridge：**独立**挂载，不依赖 settings seam ——
+		// dsh 0.1.7（Desktop 2.0.14）的 settings 服务没有 register()（配置改由
+		// 插件 Config schema 派生），settings 回调会提前返回；桥接必须无条件
+		// 可用，否则卡片 describe 404（v0.3.4 事故：配置区因此空白）。
+		ctx.inject(['webServer'], (bridgeCtx) => {
+			const disposers = [];
+			for (const route of makeBridgeRoutes({ trustedOrigins: config?.trustedOrigins })) {
+				disposers.push(bridgeCtx.webServer.register(route));
+			}
+			log.info(`${TAG} 设置桥接已挂载 ${BRIDGE_PREFIX}（${disposers.length} 条路由）`);
+			bridgeCtx.effect(() => () => {
+				for (const dispose of disposers) dispose();
+			});
+		});
+
+		// —— settings 模式（dsh 0.1.5 的 seam.register 通道；0.1.7+ 走不到）——
 		// 回调必须**同步**（Cordis 的 inject 回调返回后 runtime session 即释放，
 		// await 之后再调 sctx.effect 会炸）；所有动态 import 已在 apply 顶部完成，
 		// 目录刷新这类异步工作放进 timer / watch 回调，绝不触碰 sctx。
 		ctx.inject(['settings'], (sctx) => {
 			const seam = sctx?.settings;
 			if (!seam || typeof seam.register !== 'function') {
-				log.warn(`${TAG} settings seam 不可用，配置仅来自条目/文件`);
+				log.warn(`${TAG} settings seam 不可用（本版本由插件 Config schema 派生配置），配置仅来自条目/文件`);
 				return;
 			}
 			state.seam = seam;
@@ -850,17 +879,6 @@ async function apply(ctx, config = {}) {
 					disposeWatch();
 					disposeDoc();
 					for (const timer of timers) clearTimeout(timer);
-				});
-				// bridge：等 webServer 服务可用后挂载（文件模式也挂——卡片要显示状态/迁移）
-				ctx.inject(['settings', 'webServer'], (bridgeCtx) => {
-					const disposers = [];
-					for (const route of makeBridgeRoutes(bridgeCtx.settings, { trustedOrigins: config?.trustedOrigins })) {
-						disposers.push(bridgeCtx.webServer.register(route));
-					}
-					log.info(`${TAG} 设置桥接已挂载 ${BRIDGE_PREFIX}（${disposers.length} 条路由）`);
-					bridgeCtx.effect(() => () => {
-						for (const dispose of disposers) dispose();
-					});
 				});
 			} catch (error) {
 				log.error(`${TAG} settings 注册失败，配置仅来自条目/文件: ${error?.message ?? error}`);
