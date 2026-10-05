@@ -123,6 +123,9 @@ host 桥接没挂上或不是本机访问。确认 DSH ≥ 0.1.0-rc.7 且重启�
 **`连接 SOCKS5 代理超时 / UND_ERR_SOCKS_AUTH_FAILED`**
 代理客户端没开、端口不对、认证信息错误。
 
+**模型联网搜索时，搜索流量走哪条路？和模型的代理设置有关吗？**
+分三层：① DSH 内置 `web_search` 是**服务端搜索**——由搜索端点（默认 DeepSeek）的服务器替你搜，用它们的网络，本机只发一个搜索 API 请求；该请求经本插件路由，但按**搜索密钥的归属**（通常是默认走向），与当前聊天用哪个模型**无关**。② 内置 `web_fetch` 抓取**不经过本插件**（见已知限制）。③ 若模型服务商自身带搜索能力（服务端工具），搜索同样在服务商的服务器上执行。
+
 ## 与官方出站代理的关系
 
 | 能力 | 本插件 | 官方 dsh-http-proxy | @superfish058/dsh-llm-proxy |
@@ -133,6 +136,7 @@ host 桥接没挂上或不是本机访问。确认 DSH ≥ 0.1.0-rc.7 且重启�
 | 多代理池、每规则选不同代理 | ✓ | ✗ 单一出口 | ✗ 单一出口 |
 | 按提供商（账号）分流（同域多账号） | ✓（按密钥识别） | ✗ | ✗（域名粒度） |
 | 与其他代理机制 | fetch 层拦截，互不抢占 | 替换全局 dispatcher | 复用官方全局 dispatcher |
+| 覆盖范围 | 进程内 `globalThis.fetch`（模型 API、MCP 进程内请求…）；**不含 DSH 内置 web_fetch**（见已知限制） | 进程内全部流量（含 web_fetch）+ 子进程环境 | 同官方范围 |
 
 两者同时启用不冲突：本插件在 fetch 函数层先拦截，命中的走自己的 dispatcher，未命中的才落到全局 dispatcher。
 
@@ -185,6 +189,7 @@ host 桥接没挂上或不是本机访问。确认 DSH ≥ 0.1.0-rc.7 且重启�
 - undici 的 SOCKS5 支持标记为 experimental：首次使用打印一条 `ExperimentalWarning`，无害
 - 走代理的请求跟随 3xx 重定向、HTTP/1.1（undici 默认不开 HTTP/2）；HTTP(S) 代理侧禁用空闲连接复用以规避代理客户端静默关闭空闲隧道导致的挂起（Clash 实测问题）
 - 工作线程（workflow / code-runtime worker thread）里自建的 fetch 不经过本补丁
+- **DSH 内置 `web_fetch` 工具不经过本插件**：它直接 `import("undici")` 并按官方 dsh-http-proxy 的策略选 dispatcher（直连时还自带 DNS 钉扎）——想让 `web_fetch` 走代理只能配置官方出站代理插件。**内置 `web_search` 则是服务端搜索**：搜索由搜索端点（默认 `https://api.deepseek.com/anthropic/v1`）的服务器执行，用服务端的网络；只有搜索 API 请求本身经过本插件（按其密钥归属路由，未匹配则默认走向），与当前聊天用哪个模型无关
 
 ## 开发与维护
 

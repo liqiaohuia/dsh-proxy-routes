@@ -16,3 +16,6 @@ Thumbs.db
 
 *.png
 .git-msg.txt
+
+# 忽略 npm pack 产生的压缩包
+*.tgz
