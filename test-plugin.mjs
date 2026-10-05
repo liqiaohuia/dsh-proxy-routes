@@ -300,6 +300,16 @@ try {
    （官方插件页，id/order/label + view:summary|page）。错配协议 = 卡片注册进
    无人消费的 slot，UI 上"插件已装但配置不出现"。这里 mock 客户端 ctx 执行
    真实 apply，断言两代协议的注册形态。 */
+
+/* —— 11a. 源码回归：代理行用稳定 uid 作 React key——
+   用名字作 key 时改名每敲一个字符都卸载重挂输入框，焦点丢失（v0.4.1 用户实测
+   报告）。此处直接检查源码形态，防止回归。 */
+{
+	const cardSource = readFileSync(join(process.cwd(), 'src/client/Card.tsx'), 'utf8');
+	check('client 源码回归：代理行 key=row.uid（改名不丢焦点）', cardSource.includes('key={row.uid}'));
+	check('client 源码回归：不再有 key={name} 的行映射', !cardSource.includes('key={name}'));
+}
+
 if (registration) {
 	try {
 		const realRequire = createRequire(new URL('./node_modules/react/package.json', import.meta.url));

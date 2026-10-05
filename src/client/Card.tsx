@@ -169,6 +169,18 @@ type TestMap = Record<string, { pending?: boolean } & Partial<TestOutcome>>
 /** 渲染形态：summary = 官方插件详情页的一行简介（父容器是 <p>，只能内联文本）；page/缺省 = 完整配置卡。 */
 type CardView = 'summary' | 'page' | undefined
 
+/** 代理池编辑行：uid 是稳定的行标识——**绝不能用名字当 React key**，
+ * 否则改名时每敲一个字符 key 都会变，React 卸载重挂输入框导致焦点丢失。 */
+interface ProxyRowDraft {
+	uid: string
+	name: string
+	url: string
+}
+
+const newUid = (): string => (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+	? crypto.randomUUID()
+	: `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`)
+
 /**
  * 卡片入口。本身不含 hooks，可按 view 提前分支（React Hook 规则）。
  * 官方插件页（plugins.item）的详情里 summary 父容器是 <p>——必须内联文本。
@@ -199,6 +211,8 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 	const [saveMsg, setSaveMsg] = useState<string | null>(null)
 	const [tests, setTests] = useState<TestMap>({})
 	const [migrating, setMigrating] = useState(false)
+	// 代理池行：独立于 draft 的行数组（uid 稳定，改名不重挂）；保存时才汇成 Record
+	const [proxyRows, setProxyRows] = useState<ProxyRowDraft[]>([])
 
 	const load = useCallback(async () => {
 		try {
@@ -206,6 +220,11 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 			if (payload.ok && payload.value) {
 				setValue(payload.value)
 				setDraft(payload.value)
+				// 名字没变的行沿用原 uid（避免保存回读后不必要重挂）
+				setProxyRows((prev) => Object.entries(payload.value.proxies).map(([n, u]) => {
+					const hit = prev.find((r) => r.name === n)
+					return hit ? { uid: hit.uid, name: n, url: u } : { uid: newUid(), name: n, url: u }
+				}))
 				setError(null)
 			} else {
 				setError(payload.message ?? t('loadFailed'))
@@ -222,33 +241,25 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 	}
 
 	const readOnly = value.mode === 'file'
-	const proxyNames = Object.keys(draft.proxies)
-	// 走向下拉的全部选项：直连、单代理（配了才出现）、池中的每个名字
+	// 走向下拉的全部选项：直连、单代理（配了才出现）、池中的每个名字（去重，空名跳过）
+	const poolNames = [...new Set(proxyRows.map((r) => r.name.trim()).filter(Boolean))]
 	const viaOptions: string[] = ['direct']
-	if (draft.singleProxy || draft.proxies.default) viaOptions.push('proxy')
-	for (const name of proxyNames) if (name !== 'default') viaOptions.push(name)
+	if (draft.singleProxy || poolNames.includes('default')) viaOptions.push('proxy')
+	for (const name of poolNames) if (name !== 'default') viaOptions.push(name)
 	const viaLabel = (via: string): string =>
 		via === 'direct' ? t('direct') : via === 'proxy' ? t('proxy') : via
 
 	const patch = (part: Partial<DescribeValue>) => setDraft({ ...draft, ...part })
 
-	const setProxyName = (oldName: string, newName: string) => {
-		const proxies = { ...draft.proxies }
-		const entries = Object.entries(proxies).map(([n, u]) => [n === oldName ? newName : n, u] as const)
-		const rebuilt: Record<string, string> = {}
-		for (const [n, u] of entries) rebuilt[n] = u
-		patch({ proxies: rebuilt })
-	}
-	const setProxyUrl = (name: string, url: string) => patch({ proxies: { ...draft.proxies, [name]: url } })
-	const removeProxy = (name: string) => {
-		const proxies = { ...draft.proxies }
-		delete proxies[name]
-		patch({ proxies })
-	}
-	const addProxy = () => {
+	// 代理池行编辑（按 uid 定位行——见 ProxyRowDraft 注释）
+	const patchProxyRow = (uid: string, part: Partial<ProxyRowDraft>) =>
+		setProxyRows((rows) => rows.map((r) => (r.uid === uid ? { ...r, ...part } : r)))
+	const removeProxyRow = (uid: string) => setProxyRows((rows) => rows.filter((r) => r.uid !== uid))
+	const addProxyRow = () => {
+		const names = new Set(proxyRows.map((r) => r.name))
 		let i = 1
-		while (draft.proxies[`proxy${i}`]) i += 1
-		patch({ proxies: { ...draft.proxies, [`proxy${i}`]: '' } })
+		while (names.has(`proxy${i}`)) i += 1
+		setProxyRows((rows) => [...rows, { uid: newUid(), name: `proxy${i}`, url: '' }])
 	}
 
 	const setProviderVia = (pid: string, via: string) => patch({ providerRoutes: { ...draft.providerRoutes, [pid]: via } })
@@ -258,7 +269,7 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 		const body: Record<string, unknown> = { kind, key, name: key }
 		if (kind === 'proxy') {
 			// 传**草稿地址**：新添加、尚未保存的代理也能立即测试
-			body.url = key === '(default)' ? draft.singleProxy ?? '' : draft.proxies[key] ?? ''
+			body.url = key === '(default)' ? draft.singleProxy ?? '' : proxyRows.find((r) => r.name === key)?.url ?? ''
 		}
 		const outcome = await postJson<TestOutcome & { ok: boolean }>('/test', body).catch(() => ({ ok: false, key, message: 'network error' }))
 		setTests((prev) => ({ ...prev, [key]: { ...outcome, pending: false } }))
@@ -287,9 +298,12 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 		if (readOnly) return
 		setSaving(true)
 		setSaveMsg(null)
+		// 池行汇成 Record：空名/空地址的行跳过（同名后行覆盖前行）
 		const cleanedProxies: Record<string, string> = {}
-		for (const [name, url] of Object.entries(draft.proxies)) {
-			if (name.trim() && url.trim()) cleanedProxies[name.trim()] = url.trim()
+		for (const row of proxyRows) {
+			const n = row.name.trim()
+			const u = row.url.trim()
+			if (n && u) cleanedProxies[n] = u
 		}
 		const cleanedProviderRoutes: Record<string, string> = {}
 		for (const [pid, via] of Object.entries(draft.providerRoutes)) {
@@ -327,15 +341,15 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 
 			<div style={S.section}>
 				<span style={S.sectionTitle}>{t('proxies')}</span>
-				{Object.entries(draft.proxies).map(([name, url]) => (
-					<div key={name} style={S.row}>
-						<input style={{ ...S.input, ...S.inputNarrow, ...(readOnly ? S.disabled : {}) }} value={name} disabled={readOnly}
-							onChange={(e) => setProxyName(name, e.target.value)} aria-label={t('proxyName')} />
-						<input style={{ ...S.input, ...(readOnly ? S.disabled : {}) }} value={url} disabled={readOnly}
-							onChange={(e) => setProxyUrl(name, e.target.value)} aria-label={t('proxyUrl')} placeholder="socks5://127.0.0.1:1080" />
-						<button style={S.button} onClick={() => void runTest('proxy', name)}>{t('test')}</button>
-						<button style={{ ...S.button, ...(readOnly ? S.disabled : {}) }} disabled={readOnly} onClick={() => removeProxy(name)}>{t('remove')}</button>
-						{testBadge(tests[name])}
+				{proxyRows.map((row) => (
+					<div key={row.uid} style={S.row}>
+						<input style={{ ...S.input, ...S.inputNarrow, ...(readOnly ? S.disabled : {}) }} value={row.name} disabled={readOnly}
+							onChange={(e) => patchProxyRow(row.uid, { name: e.target.value })} aria-label={t('proxyName')} />
+						<input style={{ ...S.input, ...(readOnly ? S.disabled : {}) }} value={row.url} disabled={readOnly}
+							onChange={(e) => patchProxyRow(row.uid, { url: e.target.value })} aria-label={t('proxyUrl')} placeholder="socks5://127.0.0.1:1080" />
+						<button style={S.button} onClick={() => void runTest('proxy', row.name)}>{t('test')}</button>
+						<button style={{ ...S.button, ...(readOnly ? S.disabled : {}) }} disabled={readOnly} onClick={() => removeProxyRow(row.uid)}>{t('remove')}</button>
+						{testBadge(tests[row.name])}
 					</div>
 				))}
 				<div style={S.row}>
@@ -349,7 +363,7 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 					) : null}
 				</div>
 				<div style={S.row}>
-					<button style={{ ...S.button, ...(readOnly ? S.disabled : {}) }} disabled={readOnly} onClick={addProxy}>{t('addProxy')}</button>
+					<button style={{ ...S.button, ...(readOnly ? S.disabled : {}) }} disabled={readOnly} onClick={addProxyRow}>{t('addProxy')}</button>
 				</div>
 			</div>
 
