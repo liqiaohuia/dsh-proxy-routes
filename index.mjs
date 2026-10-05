@@ -344,6 +344,8 @@ async function apply(ctx, config = {}) {
 		keyRoutes: new Map(),
 		/** 提供商 id → baseURL host（describe 得来，卡片展示用）。 */
 		providerHosts: new Map(),
+		/** 最近一次密钥映射的签名（条数+提供商集合）——未变化时不重复打日志。 */
+		keyRoutesSignature: '',
 		/** 当前模型目录（listModels 输出，settings 模式热刷新）。 */
 		rows: [],
 		/** 'file' | 'settings' */
@@ -581,8 +583,14 @@ async function apply(ctx, config = {}) {
 		}
 		state.keyRoutes = next;
 		state.providerHosts = hosts;
-		const names = [...new Set(next.values())];
-		log.info(`${TAG} 密钥→提供商映射已建立：${next.size} 条（提供商 ${names.join(', ') || '无'}）`);
+		// 仅在提供商集合真的变化时打日志——DSH 每条消息都可能触发无关的
+		// settings 写入，重复重建若每次都打日志会刷屏。
+		const names = [...new Set(next.values())].sort();
+		const signature = `${next.size}|${names.join(',')}`;
+		if (signature !== state.keyRoutesSignature) {
+			state.keyRoutesSignature = signature;
+			log.info(`${TAG} 密钥→提供商映射已建立：${next.size} 条（提供商 ${names.join(', ') || '无'}）`);
+		}
 		return true;
 	};
 
@@ -1039,9 +1047,22 @@ async function apply(ctx, config = {}) {
 				} catch { /* describe 失败时保留现值 */ }
 			};
 			let keyRebuildDebounce = null;
-			/** 文档更新（自己的保存 / provider 配置变化）→ 应用 + 目录 + 密钥映射。 */
+			/** 文档更新（自己的保存 / provider 配置变化）→ 应用 + 目录 + 密钥映射。
+			 * 其他条目的写入（DSH 每条消息都可能写会话状态等无关文档）一律忽略。 */
 			const onDocumentUpdated = (ns) => {
-				if (ns === undefined || String(ns) === NAMESPACE) applyEntryConfigFromSettings();
+				const nsId = ns === undefined ? undefined : String(ns);
+				if (nsId === undefined || nsId === NAMESPACE) {
+					applyEntryConfigFromSettings();
+				} else {
+					let providerDoc = false;
+					try {
+						const row = seam.describe().find((d) => String(d.ns) === nsId);
+						const v = row?.value;
+						providerDoc = v !== null && typeof v === 'object' && !Array.isArray(v)
+							&& typeof v.providers === 'object' && v.providers !== null && !Array.isArray(v.providers);
+					} catch { /* ignore */ }
+					if (!providerDoc) return;
+				}
 				try { refreshCatalog(false); } catch { /* ignore */ }
 				if (keyRebuildDebounce) clearTimeout(keyRebuildDebounce);
 				keyRebuildDebounce = setTimeout(() => {
