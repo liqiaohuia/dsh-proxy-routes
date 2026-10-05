@@ -1,6 +1,6 @@
 {
   "name": "dsh-proxy-routes",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "DSH (DeepSeek Harness) plugin: per-provider (account) proxy routing with a named proxy pool -?route each LLM account through its own SOCKS5/HTTP(S) proxy via DSH's bundled undici, configurable live from the DSH settings page.",
   "type": "module",
   "main": "index.mjs",
