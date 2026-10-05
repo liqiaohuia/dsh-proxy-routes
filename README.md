@@ -30,9 +30,10 @@ DSH ≥ 0.1.3（自带 undici ≥ 7.10，含 Socks5ProxyAgent）。
     输入框/下拉框当前的**草稿值**，无需先保存）
 - **代理池**：多个命名代理（`proxies`），每条规则按名字引用；SOCKS5 / HTTP
   CONNECT / 代理端 TLS（https://）三种协议混用
-- **文件模式兼容**：v0.2 的 `$DSH_HOME/proxy-routes.jsonc` 存在时继续生效，
-  卡片显示「迁移到设置页」按钮一键搬家（原文件保留 `.bak`）；文件模式下
-  编辑控件置灰只读（测试按钮仍可用）
+- **设置页为默认姿态**：安装即用设置页（设置 → 代理路由）配置，无需任何文件。
+  插件**不再自动生成**配置文件；`$DSH_HOME/proxy-routes.jsonc` 仅在用户**手动
+  创建**时生效（dsh web 命令行用户自管，改动热生效），此时卡片只读并显示一行
+  说明（编辑该文件或删除它回到设置页）
 
 ## 安装
 
@@ -111,9 +112,11 @@ dsh plugin --profile web add https://github.com/<you>/dsh-proxy-routes.git
 
 ## 配置
 
-**优先级**：`$DSH_HOME/proxy-routes.jsonc` 存在时**文件优先**（v0.2 兼容），
-卡片变为只读并显示迁移按钮；文件不存在时用设置页（settings.yaml 的
-`proxy-routes` 命名空间）。条目配置 `config.configFile` 可显式指定其他文件。
+**设置页是默认方式**（dsh 0.1.5+ / DSH Desktop）：安装后无需任何文件，卡片
+保存即生效。**文件模式**仅在用户手动创建 `$DSH_HOME/proxy-routes.jsonc` 时
+激活（面向 `dsh web` 命令行用户自管配置，改动热生效），此时卡片只读并显示
+一行说明；删除该文件并重启即回到设置页。条目配置 `config.configFile` 可显式
+指定其他文件路径。
 
 ### 设置页字段（与 jsonc 字段一一对应）
 
@@ -152,7 +155,7 @@ dsh plugin --profile web add https://github.com/<you>/dsh-proxy-routes.git
 1. **配置**：dsh 0.1.7（Desktop 2.0.14）从插件导出的 **Config schema**（volatile
    字段）派生条目配置，官方设置表单与卡片保存（`SettingsForms.mutate`，同一
    op 协议）都落到条目配置；dsh 0.1.5（2.0.13）则注册 `proxy-routes` 命名空间。
-   `$DSH_HOME/proxy-routes.jsonc` 存在时文件优先
+   用户手动创建 `$DSH_HOME/proxy-routes.jsonc` 时文件模式生效（优先于设置页）
 2. **密钥 → 提供商映射**：settings `describe`（未脱敏，仅内存）读到各提供商的
    `apiKeyEnv` 凭据引用，经 credentials 服务（或环境变量）解析成密钥，建立
    密钥 → 提供商映射；provider 配置变化时自动重建。**密钥绝不写日志**
@@ -266,8 +269,8 @@ npm 包/仓库信息），合并后约一天内自动出现在市场的浏览/�
   这是探测地址的属性而非路由故障——把「其他选项」里的探测地址改成墙内外都
   可达的（如 `https://www.baidu.com`）即可让直连/代理两边都能真实测试
 - 设置页卡片要求 DSH ≥ 0.1.0-rc.7（settings.plugin.item slot 与 settings
-  namespace 机制）；更老版本上插件自动降级为纯文件模式（`enabled`/`configFile`
-  条目配置仍可用）
+  namespace 机制）；更老版本上插件不加载配置——需手动创建
+  `$DSH_HOME/proxy-routes.jsonc` 文件方可使用（`configFile` 条目配置可改路径）
 - 走代理的请求跟随 3xx 重定向（undici 默认）、HTTP/1.1（undici 默认不开
   HTTP/2）；HTTP(S) 代理侧禁用空闲连接复用以规避代理客户端静默关闭空闲隧道
   导致的挂起（Clash 实测问题）

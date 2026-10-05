@@ -26,9 +26,9 @@
 // 注意：schemastery 在模块顶层静态导入（export const Config 需要在加载期就绪）。
 // 静态 import 不含顶层 await，不影响桌面版 require(esm) 桥（v0.3.1 的教训只针对 TLA）。
 
-import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { existsSync, watch, watchFile, unwatchFile } from 'node:fs';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import Schema from '@deepseek-ai/schemastery';
 import { ensureTransport, getUndici, normalizeProxyUrl, DispatcherPool, probeVia } from './transport.mjs';
@@ -40,8 +40,6 @@ const inject = [];
 const TAG = '[proxy-routes]';
 const NAMESPACE = 'proxy-routes';
 const BRIDGE_PREFIX = '/api/dsh-proxy-routes/settings';
-/** 出现文件模式后，settings 桥延迟这段时间仍无任何配置时生成模板兜底（无 settings 的环境）。 */
-const FALLBACK_TEMPLATE_DELAY_MS = 3000;
 
 /* ------------------------------------------------------------------ */
 /* 配置归一化（jsonc 文件值与 settings 值共用）                          */
@@ -200,37 +198,6 @@ function stripJsonComments(text) {
 	}
 	return out;
 }
-
-/** 首次启动时自动生成的配置模板。 */
-const DEFAULT_CONFIG_TEMPLATE = `{
-  // ============================================================
-  // dsh-proxy-routes 代理分流配置（首次启动自动生成）
-  // 保存后约 0.3 秒自动生效，无需重启 dsh。
-  // 提示：删除本文件可改用设置页（设置 → 代理路由）图形化配置。
-  // ============================================================
-  //
-  // proxies —— 命名代理池：给每个代理起名，供 providerRoutes / default 按名字引用
-  //   "socks5://127.0.0.1:50939"  域名解析交给代理端（等效 socks5h，防 DNS 污染），
-  //                              可带认证 socks5://user:pass@host:port
-  //   "http://127.0.0.1:7890"     HTTP CONNECT 隧道（可带认证 http://user:pass@host:port）
-  //   "https://127.0.0.1:7890"    代理端 TLS（undici 原生支持）
-  //
-  // default —— 未命中提供商规则的一切流量走哪条路："direct"、代理名或 "proxy"（单代理）
-  //
-  // providerRoutes —— 按提供商（账号）分流：插件按每个请求携带的 API 密钥识别
-  //   它属于哪个提供商（账号），因此同一模型服务商的多个账号可以各走各的代理。
-  //   提供商 id 即 DSH「模型」页里各账号的提供商 ID（claude1、claude2、…）。
-  //   未列出的提供商按 default 走。例：
-  //     "providerRoutes": { "claude1": "proxy", "claude2": "direct" }
-  //   claude1（免费额度）走代理，claude2（付费主力）强制直连。
-  //
-  // logRequests —— 打印每次走代理的请求（true/false，默认 true）
-
-  "proxy": "socks5://127.0.0.1:50939",
-  "default": "direct",
-  "logRequests": true
-}
-`;
 
 /* ------------------------------------------------------------------ */
 /* 日志                                                                 */
@@ -755,13 +722,12 @@ async function apply(ctx, config = {}) {
 			}
 			return [...byId.values()];
 		};
-		/** 当前生效配置的摘要（卡片状态区：文件模式提示 + 冲突列表）。 */
+		/** 当前生效配置的摘要（卡片状态区：文件模式提示 + 提供商清单）。 */
 		const statusPayload = () => ({
 			ok: true,
 			value: {
 				mode: state.mode,
 				configFile: state.mode === 'file' ? configFile : null,
-				settingsAvailable: Boolean(state.seam && typeof state.seam.mutate === 'function'),
 				proxies: Object.fromEntries([...state.cfg?.proxies.entries() ?? []].map(([n, u]) => [n, u.href])),
 				singleProxy: state.cfg?.singleProxy?.href ?? null,
 				default: state.cfg?.defaultVia ?? 'direct',
@@ -906,51 +872,6 @@ async function apply(ctx, config = {}) {
 				writeJson(res, 400, { ok: false, code: 'bad-request', message: 'kind must be "proxy", "provider" or "model"' });
 			},
 		});
-		routes.push({
-			kind: 'exact',
-			path: `${BRIDGE_PREFIX}/migrate`,
-			handler: async (req, res) => {
-				if (!guard(req, res)) return;
-				if (state.mode !== 'file') {
-					writeJson(res, 200, { ok: false, code: 'not-file-mode', message: '仅在配置文件模式下可迁移' });
-					return;
-				}
-				try {
-					const text = (await readFile(configFile, 'utf8')).replace(/^\uFEFF/, '');
-					const parsed = JSON.parse(stripJsonComments(text));
-					// 整段写入条目配置（覆盖式）；modelRoutes 迁移为 providerRoutes 前缀
-					const providerRoutes = parsed.providerRoutes && typeof parsed.providerRoutes === 'object' && !Array.isArray(parsed.providerRoutes)
-						? { ...parsed.providerRoutes }
-						: {};
-					for (const [key, via] of Object.entries(parsed.modelRoutes ?? {})) {
-						const slash = key.indexOf('/');
-						const pid = slash > 0 ? key.slice(0, slash) : '';
-						if (pid && providerRoutes[pid] === undefined) providerRoutes[pid] = via;
-					}
-					const singleProxy = typeof parsed.singleProxy === 'string' ? parsed.singleProxy
-						: (typeof parsed.proxy === 'string' ? parsed.proxy : '');
-					const ops = [
-						{ op: 'set', path: ['singleProxy'], value: singleProxy },
-						{ op: 'set', path: ['proxies'], value: parsed.proxies && typeof parsed.proxies === 'object' && !Array.isArray(parsed.proxies) ? parsed.proxies : {} },
-						{ op: 'set', path: ['default'], value: typeof parsed.default === 'string' ? parsed.default : 'direct' },
-						{ op: 'set', path: ['providerRoutes'], value: providerRoutes },
-						{ op: 'set', path: ['logRequests'], value: parsed.logRequests !== false },
-						{ op: 'set', path: ['probeUrl'], value: typeof parsed.probeUrl === 'string' && parsed.probeUrl ? parsed.probeUrl : 'https://www.gstatic.com/generate_204' },
-					];
-					const seam = requireSeam(res);
-					if (!seam) return;
-					await seam.mutate(NAMESPACE, ops);
-					await rename(configFile, `${configFile}.bak`);
-					writeJson(res, 200, { ok: true, value: { migrated: true, backup: `${configFile}.bak` } });
-					log.info(`${TAG} 配置已迁移到设置页（原文件保留为 ${configFile}.bak）`);
-					state.mode = 'settings';
-					// settings 的 watch 回调会应用新值；这里立即触发一次目录刷新
-					await refreshCatalog(false);
-				} catch (error) {
-					writeJson(res, 200, { ok: false, code: 'migrate-failed', message: error?.message ?? String(error) });
-				}
-			},
-		});
 		return routes;
 	};
 
@@ -975,24 +896,13 @@ async function apply(ctx, config = {}) {
 
 	const fileMode = existsSync(configFile);
 	if (fileMode) {
-		// v0.2 兼容：配置文件存在即生效（优先于设置页）
+		// 文件模式：仅在用户**手动**创建了配置文件时生效（CLI 用户自管）。
+		// 安装后绝不自动生成配置文件——桌面版/设置页是默认姿态。
 		state.mode = 'file';
 		startFileMode(true);
 		effect(() => installFileWatcher(), 'proxy-routes: config file watcher');
 	} else {
 		state.mode = 'settings';
-		// settings 服务完全不可用（inject 不会回调）时的兜底：延迟生成模板文件，
-		// 保留 v0.2「首次启动自动生成模板」的行为；settings 正常时 state.cfg 已就绪，不触发。
-		const timer = setTimeout(() => {
-			if (state.cfg) return;
-			mkdir(dirname(configFile), { recursive: true }).then(() => writeFile(configFile, DEFAULT_CONFIG_TEMPLATE, 'utf8')).then(() => {
-				state.mode = 'file';
-				log.info(`${TAG} 未找到配置文件且 settings 不可用，已生成模板 ${configFile}`);
-				startFileMode(true);
-				state.watchStopper = installFileWatcher();
-			}).catch(() => { /* ignore */ });
-		}, FALLBACK_TEMPLATE_DELAY_MS);
-		timer.unref?.();
 	}
 
 	if (typeof ctx?.inject === 'function') {
@@ -1018,7 +928,7 @@ async function apply(ctx, config = {}) {
 		ctx.inject(['settings'], (sctx) => {
 			const seam = sctx?.settings;
 			if (!seam || typeof seam.describe !== 'function') {
-				log.warn(`${TAG} settings 服务不可用，配置仅来自条目/文件`);
+				log.warn(`${TAG} settings 服务不可用：配置仅来自条目配置或配置文件；如需文件模式请手动创建 ${configFile}`);
 				return;
 			}
 			state.seam = seam;
@@ -1150,21 +1060,11 @@ async function apply(ctx, config = {}) {
 			}
 		});
 	} else {
-		// 无 cordis inject（mock ctx / 测试环境）：条目配置或配置文件直接生效
+		// 无 cordis inject（mock ctx / 测试环境）：条目配置或配置文件直接生效。
+		// 不再自动生成模板文件——需要文件模式的用户自己创建（CLI 姿态）。
 		const hasConfig = config && (typeof config === 'object') && Object.keys(config).some((k) => !['enabled', 'configFile'].includes(k));
 		if (!fileMode && hasConfig) {
 			applyRawConfig(config, '条目配置', true);
-		}
-		if (state.cfg === null) {
-			// 无文件、无配置、无 settings：延迟生成模板兜底（v0.2 行为）
-			const timer = setTimeout(() => {
-				if (state.cfg) return;
-				mkdir(dirname(configFile), { recursive: true }).then(() => writeFile(configFile, DEFAULT_CONFIG_TEMPLATE, 'utf8')).then(() => {
-					state.mode = 'file';
-					startFileMode(true);
-				}).catch(() => { /* ignore */ });
-			}, FALLBACK_TEMPLATE_DELAY_MS);
-			timer.unref?.();
 		}
 	}
 }

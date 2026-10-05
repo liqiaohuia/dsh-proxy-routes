@@ -1,8 +1,9 @@
 // dsh-proxy-routes —— 设置页卡片：代理池 / 按提供商（账号）路由 / 测试连接。
 //
 // 数据面：卡片不直接读写 settings 传输，而是走本插件 host 侧的同源回环桥
-// /api/dsh-proxy-routes/settings/*（describe / mutate / test / migrate）。
-// 文件模式（$DSH_HOME/proxy-routes.jsonc 存在）下卡片只读（控件置灰），提供一键迁移。
+// /api/dsh-proxy-routes/settings/*（describe / mutate / test）。
+// 文件模式（用户手动创建了 $DSH_HOME/proxy-routes.jsonc 时）卡片只读并显示一行
+// 说明；设置页是默认且推荐的配置方式。
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 
@@ -27,7 +28,6 @@ export interface ProviderRow {
 export interface DescribeValue {
 	mode: 'file' | 'settings'
 	configFile: string | null
-	settingsAvailable: boolean
 	proxies: Record<string, string>
 	singleProxy: string | null
 	default: string
@@ -210,7 +210,6 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 	const [saving, setSaving] = useState(false)
 	const [saveMsg, setSaveMsg] = useState<string | null>(null)
 	const [tests, setTests] = useState<TestMap>({})
-	const [migrating, setMigrating] = useState(false)
 	// 代理池行：独立于 draft 的行数组（uid 稳定，改名不重挂）；保存时才汇成 Record
 	const [proxyRows, setProxyRows] = useState<ProxyRowDraft[]>([])
 
@@ -282,18 +281,6 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 		return <span style={S.statusBad}>{`${t('testFail')} · ${entry.message ?? ''}`}</span>
 	}
 
-	const migrate = async () => {
-		setMigrating(true)
-		const result = await postJson<{ ok: boolean; message?: string }>('/migrate', {}).catch(() => ({ ok: false }))
-		setMigrating(false)
-		if (result.ok) {
-			setSaveMsg(t('migrateDone'))
-			await load()
-		} else {
-			setSaveMsg(result.message ?? t('saveFailed'))
-		}
-	}
-
 	const save = async () => {
 		if (readOnly) return
 		setSaving(true)
@@ -327,15 +314,7 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 		<div style={S.body}>
 			{readOnly && (
 				<div style={S.section}>
-					<span style={S.warn}>{t('fileMode')}{value.configFile ? `：${value.configFile}` : ''}</span>
-					<span style={S.hint}>{t('fileLocked')}</span>
-					{value.settingsAvailable !== false && (
-						<div style={S.row}>
-							<button style={S.button} disabled={migrating} onClick={() => void migrate()}>
-								{migrating ? t('saving') : t('migrate')}
-							</button>
-						</div>
-					)}
+					<span style={S.warn}>{t('fileNotice')}{value.configFile ? `（${value.configFile}）` : ''}</span>
 				</div>
 			)}
 

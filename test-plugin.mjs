@@ -206,7 +206,7 @@ try {
 
 	await apply(ctx2, {});
 	await delay(300); // rebuildKeyRoutes 异步完成
-	check('0.1.7 settings（无 register）：桥接 5 条路由已挂载', webRoutes.filter((r) => r.kind === 'exact').length === 5);
+	check('0.1.7 settings（无 register）：桥接 4 条路由已挂载（migrate 已移除）', webRoutes.filter((r) => r.kind === 'exact').length === 4);
 
 	let r1 = null, r2 = null, r3 = null;
 	try { r1 = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY1, 'content-type': 'application/json' }, body: '{}' }); }
@@ -239,7 +239,7 @@ try {
 			&& byId.claude2?.hasKey === true && byId.claude2?.host === 'api.anthropic.com'
 			&& byId.claude3?.hasKey === false && byId.claude3?.host === 'open.bigmodel.cn');
 		check('bridge describe：不含密钥本体', !resMock.body.includes(KEY1) && !resMock.body.includes(KEY2));
-		check('bridge describe：settingsAvailable 标记', described?.value?.settingsAvailable === true);
+		check('bridge describe：mode 为 settings（默认姿态）', described?.value?.mode === 'settings');
 
 		// /test kind=proxy 带草稿地址：未保存的新代理也能立即测试（v0.4.1）
 		const testRoute = webRoutes.find((r) => r.path.endsWith('/test'));
