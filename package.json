@@ -1,7 +1,7 @@
 {
   "name": "dsh-proxy-routes",
-  "version": "0.4.3",
-  "description": "DSH (DeepSeek Harness) plugin: per-model / per-domain proxy routing with a named proxy pool, SOCKS5/HTTP(S) via DSH's bundled undici, configurable live from the DSH settings page.",
+  "version": "0.4.4",
+  "description": "DSH (DeepSeek Harness) plugin: per-provider (account) proxy routing with a named proxy pool â€?route each LLM account through its own SOCKS5/HTTP(S) proxy via DSH's bundled undici, configurable live from the DSH settings page.",
   "type": "module",
   "main": "index.mjs",
   "exports": {
@@ -23,8 +23,10 @@
     "build": "node scripts/build-client.mjs",
     "test": "node test-plugin.mjs"
   },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
   "devDependencies": {
-    "@deepseek-ai/schemastery": "^3.18.4",
     "@types/react": "~18.3.1",
     "esbuild": "^0.27.3",
     "react": "^18.2.0",
@@ -40,7 +42,7 @@
     "proxy-pool",
     "anthropic",
     "claude",
-    "per-model",
+    "per-provider",
     "cordis"
   ],
   "author": "liqiaohuia",
