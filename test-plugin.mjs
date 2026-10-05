@@ -57,7 +57,7 @@ const ctx = {
 };
 let disposeCallback = null;
 
-/* —— 临时 DSH_HOME + 双代理配置—— */
+/* —— 临时 DSH_HOME + 双代理配置（v0.4.1：域名规则已删除，只余池 + 默认走向）—— */
 const HOME = mkdtempSync(join(tmpdir(), 'dsh-proxy-test-'));
 const CONFIG = join(HOME, 'proxy-routes.jsonc');
 const configText = `{
@@ -66,13 +66,8 @@ const configText = `{
 		"main": "socks5://127.0.0.1:50939",
 		"backup": "socks5://127.0.0.1:50018"
 	},
-	"default": "direct",
-	"logRequests": true,
-	"routes": [
-		{ "domains": ["anthropic.com", "claude.ai"], "via": "main" },
-		{ "domains": ["integrate.api.nvidia.com"], "via": "backup" },
-		{ "domains": ["open.bigmodel.cn", "bigmodel.cn", "deepseek.com"], "via": "direct" }
-	]
+	"default": "main",
+	"logRequests": true
 }`;
 writeFileSync(CONFIG, configText, 'utf8');
 process.env.DSH_HOME = HOME;
@@ -87,26 +82,23 @@ check('fetch 已被补丁替换', globalThis.fetch !== originalFetch);
 check('加载日志：配置已加载', assertLog('配置已加载'));
 check('加载日志：代理池含 main 与 backup', assertLog('代理池=[main,backup]'));
 check('加载日志：文件来源', assertLog('来源=配置文件'));
+check('加载日志：无域名规则段（模块已删除）', !assertLog('域名规则'));
 
-/* —— 2~4. 网络路由（401/400 = 经代理抵达服务端；直连=401）—— */
+/* —— 2~4. 网络路由：默认走向 main —— */
 try {
 	const r1 = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
 	check('anthropic 经 main(50939) -> 401（直连为 403）', r1.status === 401);
 } catch (e) { check('anthropic 经 main(50939)', false); console.log('  ' + (e.cause?.message ?? e.message)); }
 try {
 	const r2 = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
-	check('nvidia 经 backup(50018) -> 400/401/404', [400, 401, 404].includes(r2.status));
-} catch (e) { check('nvidia 经 backup(50018)', false); console.log('  ' + (e.cause?.message ?? e.message)); }
-try {
-	const r3 = await fetch('https://open.bigmodel.cn/api/paas/v4/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
-	check('bigmodel 直连 -> 401', r3.status === 401);
-} catch (e) { check('bigmodel 直连', false); console.log('  ' + (e.cause?.message ?? e.message)); }
-check('路由日志：anthropic -> main', logs.some((l) => l.includes('api.anthropic.com/v1/messages -> main:socks5://127.0.0.1:50939')));
-check('路由日志：nvidia -> backup', logs.some((l) => l.includes('integrate.api.nvidia.com/v1/chat/completions -> backup:socks5://127.0.0.1:50018')));
+	check('nvidia 经 main(50939) -> 400/401/404', [400, 401, 404].includes(r2.status));
+} catch (e) { check('nvidia 经 main(50939)', false); console.log('  ' + (e.cause?.message ?? e.message)); }
+check('路由日志：anthropic -> main（默认走向）', logs.some((l) => l.includes('api.anthropic.com/v1/messages -> main:socks5://127.0.0.1:50939')));
+check('路由日志：nvidia -> main（默认走向）', logs.some((l) => l.includes('integrate.api.nvidia.com/v1/chat/completions -> main:socks5://127.0.0.1:50939')));
 
-/* —— 5. 热重载：把 anthropic 改走 backup —— */
+/* —— 5. 热重载：把默认走向改到 backup —— */
 logs.length = 0;
-writeFileSync(CONFIG, configText.replace('"via": "main"', '"via": "backup"'), 'utf8');
+writeFileSync(CONFIG, configText.replace('"default": "main"', '"default": "backup"'), 'utf8');
 await delay(1200);
 check('热重载：新配置日志（无 announce）+ anthropic -> backup 路由日志', await (async () => {
 	try {
@@ -151,10 +143,11 @@ try {
 	const plugin = require_('./index.mjs');
 	const schema = plugin.Config;
 	check('Config schema 导出（0.1.7 settings 派生依赖）', Boolean(schema) && schema.type === 'object');
-	check('Config schema：proxies / providerRoutes / routes 为 volatile dict/list',
+	check('Config schema：proxies / providerRoutes / default 为 volatile',
 		schema?.dict?.proxies?.meta?.volatile === true
 		&& schema?.dict?.providerRoutes?.meta?.volatile === true
-		&& schema?.dict?.routes?.meta?.volatile === true);
+		&& schema?.dict?.default?.meta?.volatile === true);
+	check('Config schema：routes 字段已删除（v0.4.1 域名分流移除）', schema?.dict?.routes === undefined);
 	check('Config schema：configFile / trustedOrigins 非 volatile（改它们应重挂载）',
 		!schema?.dict?.configFile?.meta?.volatile && !schema?.dict?.trustedOrigins?.meta?.volatile);
 }
@@ -188,6 +181,7 @@ try {
 				providers: {
 					claude1: { apiKeyEnv: 'DPR_TEST_K1', baseURL: 'https://api.anthropic.com', displayName: 'Claude #1', models: [{ id: 'claude-x', name: 'Claude X' }] },
 					claude2: { apiKeyEnv: 'DPR_TEST_K2', baseURL: 'https://api.anthropic.com', displayName: 'Claude #2', models: [{ id: 'claude-y', name: 'Claude Y' }] },
+					claude3: { baseURL: 'https://open.bigmodel.cn/api/paas/v4', displayName: 'Claude #3', models: [{ id: 'claude-z', name: 'Claude Z' }] },
 				},
 			},
 		},
@@ -238,11 +232,38 @@ try {
 		let described = null;
 		try { described = JSON.parse(resMock.body); } catch { /* ignore */ }
 		const providers = described?.value?.providers ?? [];
-		check('bridge describe：providers 含 claude1/claude2（hasKey + host）',
-			providers.length === 2
-			&& providers.every((p) => p.hasKey === true && p.host === 'api.anthropic.com' && typeof p.id === 'string'));
+		const byId = Object.fromEntries(providers.map((p) => [p.id, p]));
+		check('bridge describe：providers 含 claude1/claude2/claude3（hasKey + host 来自 baseURL）',
+			providers.length === 3
+			&& byId.claude1?.hasKey === true && byId.claude1?.host === 'api.anthropic.com'
+			&& byId.claude2?.hasKey === true && byId.claude2?.host === 'api.anthropic.com'
+			&& byId.claude3?.hasKey === false && byId.claude3?.host === 'open.bigmodel.cn');
 		check('bridge describe：不含密钥本体', !resMock.body.includes(KEY1) && !resMock.body.includes(KEY2));
 		check('bridge describe：settingsAvailable 标记', described?.value?.settingsAvailable === true);
+
+		// /test kind=proxy 带草稿地址：未保存的新代理也能立即测试（v0.4.1）
+		const testRoute = webRoutes.find((r) => r.path.endsWith('/test'));
+		if (testRoute) {
+			const resOf = () => ({ statusCode: null, body: '', writeHead(code) { this.statusCode = code; }, end(b) { this.body = String(b); } });
+			const reqOf = (payload) => ({
+				socket: { remoteAddress: '127.0.0.1' },
+				headers: { host: '127.0.0.1:43120', 'content-type': 'application/json' },
+				on: (event, cb) => { if (event === 'data') setImmediate(() => cb(Buffer.from(JSON.stringify(payload)))); if (event === 'end') setImmediate(() => cb()); },
+			});
+			const rDraft = resOf();
+			await testRoute.handler(reqOf({ kind: 'proxy', name: 'brand-new', url: 'socks5://127.0.0.1:50939' }), rDraft);
+			check('/test proxy：草稿地址（未保存的代理）可测且通', JSON.parse(rDraft.body).ok === true);
+			const rBad = resOf();
+			await testRoute.handler(reqOf({ kind: 'proxy', name: 'brand-new', url: 'not-a-proxy://x' }), rBad);
+			check('/test proxy：非法草稿地址返回 ok=false + 解析错误', JSON.parse(rBad.body).ok === false);
+			const rProv = resOf();
+			await testRoute.handler(reqOf({ kind: 'provider', key: 'claude3', name: 'claude3', url: '' }), rProv);
+			const provPayload = JSON.parse(rProv.body);
+			check('/test provider：无显式走向的提供商回退默认走向（不报未知）',
+				provPayload.via === 'direct' && provPayload.message !== '未知提供商');
+		} else {
+			check('bridge /test 路由存在', false);
+		}
 	} else {
 		check('bridge describe 路由存在', false);
 	}

@@ -1,4 +1,4 @@
-// dsh-proxy-routes —— DSH 代理路由插件：按「提供商（账号）/ 域名」分流，支持命名代理池。
+// dsh-proxy-routes —— DSH 代理路由插件：按「提供商（账号）」分流，支持命名代理池。
 //
 // 配置来源（优先级从高到低）：
 //   1. 配置文件（$DSH_HOME/proxy-routes.jsonc，JSONC 语法，保存热生效）—— v0.2
@@ -7,11 +7,11 @@
 //      「从插件导出的 Config schema 派生」——本插件导出 volatile 字段的 Config，
 //      官方设置表单可直接编辑，卡片保存走 SettingsForms.mutate（同一 op 协议）
 //
-// 路由语义（v0.4）：每个 LLM 请求都会带上其提供商的 API 密钥头
+// 路由语义（v0.4.1）：每个 LLM 请求都会带上其提供商的 API 密钥头
 // （x-api-key / authorization: Bearer），fetch 补丁据此刻意识别「本次请求属于
 // 哪个提供商（账号）」，实现同一域名下多账号走不同代理——这是域名规则做不到
-// 的。优先级：提供商显式走向 > 域名规则 > 默认走向。旧版「按模型」的
-// modelRoutes 在归一化时自动迁移为按提供商（取 "providerId/modelId" 的前缀）。
+// 的（v0.4.1 起按域名分流已整体移除）。优先级：提供商显式走向 > 默认走向。
+// 旧版「按模型」的 modelRoutes 在归一化时自动迁移为按提供商（取前缀）。
 //
 // 传输层（transport.mjs）：DSH 自带 undici——Socks5ProxyAgent（socks5h 语义，
 // 域名在代理端解析）/ ProxyAgent（http(s):// CONNECT，代理端 TLS + 认证），
@@ -74,20 +74,7 @@ function normalizeRawConfig(raw, label) {
 	}
 	// 默认走向
 	const defaultVia = raw.default === undefined ? 'direct' : String(raw.default);
-	// 域名规则
-	const domainRules = [];
-	if (raw.routes !== undefined) {
-		if (!Array.isArray(raw.routes)) throw new Error(`${TAG} ${label} 的 "routes" 必须是数组`);
-		domainRules.push(...raw.routes.map((route, i) => {
-			if (route === null || typeof route !== 'object') throw new Error(`${TAG} ${label} 的 routes[${i}] 必须是对象`);
-			if (typeof route.via !== 'string' || route.via === '') throw new Error(`${TAG} ${label} 的 routes[${i}].via 必须是代理名、"direct" 或 "proxy"`);
-			const domains = Array.isArray(route.domains)
-				? route.domains.filter((d) => typeof d === 'string' && d.trim() !== '').map((d) => d.trim().toLowerCase().replace(/^\.+/, ''))
-				: [];
-			if (domains.length === 0) throw new Error(`${TAG} ${label} 的 routes[${i}].domains 必须是非空字符串数组`);
-			return { domains, via: route.via };
-		}));
-	}
+	// v0.4.1：按域名分流（routes）已整体移除——旧配置里的 routes 字段直接忽略
 	// 按提供商路由（v0.4）：providerId → via。同域名的不同账号可走不同代理。
 	const providerRoutes = {};
 	if (raw.providerRoutes !== undefined) {
@@ -116,7 +103,6 @@ function normalizeRawConfig(raw, label) {
 		proxies,
 		singleProxy,
 		defaultVia,
-		domainRules,
 		providerRoutes,
 		modelRoutes,
 		logRequests: raw.logRequests !== false,
@@ -140,11 +126,11 @@ function resolveVia(via, cfg, label) {
 }
 
 /**
- * 编译完整的路由决策表：hostname → via 决策（域名规则优先，最后 default），
+ * 编译路由决策表（v0.4.1：域名规则已移除，未命中提供商的一切流量走默认走向），
  * 以及 providerId → via 决策表（fetch 层按请求密钥识别提供商后使用，
- * 同域名多账号可各自分流——这是域名规则做不到的）。
+ * 同域名多账号可各自分流）。
  * @param {object} cfg normalizeRawConfig 的输出
- * @returns {{decide: (hostname: string) => {kind:'direct'} | {kind:'proxy', name: string, url: URL},
+ * @returns {{decide: () => {kind:'direct'} | {kind:'proxy', name: string, url: URL},
  *            providerDecisions: Map<string, {kind:'direct'} | {kind:'proxy', name: string, url: URL}>,
  *            unknownProxies: string[]}}
  */
@@ -164,22 +150,8 @@ function compileRouting(cfg) {
 		checked.set(via, result);
 		return result;
 	};
-	for (const rule of cfg.domainRules) checkVia(rule.via, `routes[${rule.domains[0]}]`);
 	const defaultDecision = checkVia(cfg.defaultVia, 'default');
-	const decide = (hostname) => {
-		const h = String(hostname || '').toLowerCase();
-		for (const rule of cfg.domainRules) {
-			for (const domain of rule.domains) {
-				if (h === domain || h.endsWith('.' + domain)) {
-					const decision = checkVia(rule.via, `routes[${domain}]`);
-					if (decision.kind === 'proxy') return decision;
-					if (rule.via === 'direct') return { kind: 'direct' };
-					return decision;
-				}
-			}
-		}
-		return defaultDecision;
-	};
+	const decide = () => defaultDecision;
 	const providerDecisions = new Map();
 	for (const [pid, via] of Object.entries(cfg.providerRoutes ?? {})) {
 		providerDecisions.set(pid, checkVia(via, `providerRoutes[${pid}]`));
@@ -234,43 +206,29 @@ const DEFAULT_CONFIG_TEMPLATE = `{
   // ============================================================
   // dsh-proxy-routes 代理分流配置（首次启动自动生成）
   // 保存后约 0.3 秒自动生效，无需重启 dsh。
-  // 提示：删除本文件可改用设置页（插件 → 代理路由）图形化配置。
+  // 提示：删除本文件可改用设置页（设置 → 代理路由）图形化配置。
   // ============================================================
   //
-  // proxy —— 单代理地址（v0.2 兼容字段，等价于 proxies 里名为 "default" 的一项）：
+  // proxies —— 命名代理池：给每个代理起名，供 providerRoutes / default 按名字引用
   //   "socks5://127.0.0.1:50939"  域名解析交给代理端（等效 socks5h，防 DNS 污染），
   //                              可带认证 socks5://user:pass@host:port
   //   "http://127.0.0.1:7890"     HTTP CONNECT 隧道（可带认证 http://user:pass@host:port）
-  //   "https://127.0.0.1:7890"    代理端 TLS（由 undici 原生支持）
+  //   "https://127.0.0.1:7890"    代理端 TLS（undici 原生支持）
   //
-  // proxies —— 命名代理池（v0.3）：给每个代理起名，供下方规则按名字引用
+  // default —— 未命中提供商规则的一切流量走哪条路："direct"、代理名或 "proxy"（单代理）
   //
-  // default —— 没命中任何规则的域名走哪条路："direct"、代理名或 "proxy"（单代理）
-  //
-  // providerRoutes —— 按提供商（账号）分流（v0.4）："providerId" → 代理名 / "direct"。
-  //   插件按每个请求携带的 API 密钥识别它属于哪个提供商（账号），因此同一模型
-  //   服务商的多个账号可以各走各的代理——例如：
-  //     "providerRoutes": { "claude1": "proxy", "claude2": "direct" }
-  //   claude1 的请求走代理（免费额度、限制次数），claude2 直连（付费主力）。
-  //   未列出的提供商按 routes 域名规则 / default 走。
+  // providerRoutes —— 按提供商（账号）分流：插件按每个请求携带的 API 密钥识别
+  //   它属于哪个提供商（账号），因此同一模型服务商的多个账号可以各走各的代理。
   //   提供商 id 即 DSH「模型」页里各账号的提供商 ID（claude1、claude2、…）。
-  //
-  // routes —— 按域名分流，从上到下匹配，第一条命中生效。
-  //   domains 写域名自动覆盖子域名；via = 代理名 / "direct" / "proxy"
+  //   未列出的提供商按 default 走。例：
+  //     "providerRoutes": { "claude1": "proxy", "claude2": "direct" }
+  //   claude1（免费额度）走代理，claude2（付费主力）强制直连。
   //
   // logRequests —— 打印每次走代理的请求（true/false，默认 true）
 
   "proxy": "socks5://127.0.0.1:50939",
   "default": "direct",
-  "logRequests": true,
-
-  "routes": [
-    // Anthropic / Claude —— 海外 API，需要代理
-    { "domains": ["anthropic.com", "claude.ai"], "via": "proxy" },
-
-    // 智谱 / DeepSeek —— 国内直连
-    { "domains": ["open.bigmodel.cn", "bigmodel.cn", "deepseek.com"], "via": "direct" }
-  ]
+  "logRequests": true
 }
 `;
 
@@ -324,10 +282,6 @@ const CONFIG_FIELDS = {
 	default: Schema.string().default('direct').volatile(),
 	providerRoutes: Schema.dict(Schema.string()).default({}).volatile(),
 	modelRoutes: Schema.dict(Schema.string()).default({}).volatile(),
-	routes: Schema.array(Schema.object({
-		domains: Schema.array(Schema.string()),
-		via: Schema.string(),
-	})).default([]).volatile(),
 	logRequests: Schema.boolean().default(true).volatile(),
 	probeUrl: Schema.string().default('https://www.gstatic.com/generate_204').volatile(),
 };
@@ -341,10 +295,6 @@ function makeRegisterSchema() {
 		default: Schema.string().default('direct'),
 		providerRoutes: Schema.dict(Schema.string()).default({}),
 		modelRoutes: Schema.dict(Schema.string()).default({}),
-		routes: Schema.array(Schema.object({
-			domains: Schema.array(Schema.string()),
-			via: Schema.string(),
-		})).default([]),
 		logRequests: Schema.boolean().default(true),
 		probeUrl: Schema.string().default('https://www.gstatic.com/generate_204'),
 	});
@@ -392,6 +342,8 @@ async function apply(ctx, config = {}) {
 		providerDecisions: new Map(),
 		/** API 密钥 → 提供商 id（内存使用，绝不写日志）。 */
 		keyRoutes: new Map(),
+		/** 提供商 id → baseURL host（describe 得来，卡片展示用）。 */
+		providerHosts: new Map(),
 		/** 当前模型目录（listModels 输出，settings 模式热刷新）。 */
 		rows: [],
 		/** 'file' | 'settings' */
@@ -444,7 +396,7 @@ async function apply(ctx, config = {}) {
 	};
 	/**
 	 * 一次请求的完整决策：先按密钥识别提供商（同域名多账号可各走各的），
-	 * 未命中再落域名规则 + 默认走向。
+	 * 未命中再落默认走向。
 	 */
 	const decideForRequest = (url, input, init) => {
 		if (state.keyRoutes.size > 0) {
@@ -457,7 +409,7 @@ async function apply(ctx, config = {}) {
 				}
 			}
 		}
-		return { decision: state.decide(url.hostname), provider: null };
+		return { decision: state.decide(), provider: null };
 	};
 
 	/* —— fetch 补丁 —— */
@@ -549,10 +501,9 @@ async function apply(ctx, config = {}) {
 		for (const message of routing.unknownProxies) log.warn(`${TAG} ${message}`);
 		if (announce) {
 			const viaLabel = (via) => via === 'direct' ? '直连' : via === 'proxy' ? '代理' : via;
-			const domainSummary = cfg.domainRules.map((r) => `${r.domains.join(',')}=>${viaLabel(r.via)}`).join('；');
 			const providerSummary = Object.entries(cfg.providerRoutes).map(([pid, via]) => `${pid}=>${viaLabel(via)}`).join('，');
 			const poolNames = [...cfg.proxies.keys()].join(',');
-			log.info(`${TAG} 配置已加载 ${label}（代理池=[${poolNames || '无'}]，默认=${viaLabel(cfg.defaultVia)}，域名规则[${domainSummary}]，提供商路由[${providerSummary}]，来源=${state.mode === 'file' ? '配置文件' : '设置页'}）`);
+			log.info(`${TAG} 配置已加载 ${label}（代理池=[${poolNames || '无'}]，默认=${viaLabel(cfg.defaultVia)}，提供商路由[${providerSummary || '无'}]，来源=${state.mode === 'file' ? '配置文件' : '设置页'}）`);
 		}
 		return true;
 	};
@@ -594,6 +545,7 @@ async function apply(ctx, config = {}) {
 			credentials = undefined;
 		}
 		const next = new Map();
+		const hosts = new Map();
 		for (const row of rows ?? []) {
 			const providers = row?.value?.providers;
 			if (providers === null || typeof providers !== 'object' || Array.isArray(providers)) continue;
@@ -603,6 +555,9 @@ async function apply(ctx, config = {}) {
 				const shape = typeof profile.apiKeyEnv === 'string' || typeof profile.apiKey === 'string'
 					|| typeof profile.baseURL === 'string' || Array.isArray(profile.models);
 				if (!shape) continue;
+				if (typeof profile.baseURL === 'string' && profile.baseURL !== '' && !hosts.has(pid)) {
+					try { hosts.set(pid, new URL(profile.baseURL).hostname.toLowerCase()); } catch { /* 忽略非法 baseURL */ }
+				}
 				let key;
 				if (typeof profile.apiKey === 'string' && profile.apiKey !== '') {
 					key = profile.apiKey;
@@ -625,6 +580,7 @@ async function apply(ctx, config = {}) {
 			}
 		}
 		state.keyRoutes = next;
+		state.providerHosts = hosts;
 		const names = [...new Set(next.values())];
 		log.info(`${TAG} 密钥→提供商映射已建立：${next.size} 条（提供商 ${names.join(', ') || '无'}）`);
 		return true;
@@ -766,17 +722,28 @@ async function apply(ctx, config = {}) {
 			res.writeHead(status, { 'content-type': 'application/json' });
 			res.end(JSON.stringify(payload));
 		};
-		/** 提供商清单（卡片「按提供商」区）：目录行 + 密钥映射。绝不包含密钥本体。 */
+		/** 提供商清单（卡片「按提供商」区）：目录行 + 密钥映射 + describe 的
+		 *  baseURL。绝不包含密钥本体。 */
 		const providerRows = () => {
 			const byId = new Map();
+			const ensureRow = (pid) => {
+				let row = byId.get(pid);
+				if (row === undefined) {
+					row = { id: pid, host: '', hasKey: false, via: state.cfg?.providerRoutes?.[pid] ?? '' };
+					byId.set(pid, row);
+				}
+				return row;
+			};
 			for (const row of state.rows) {
-				const hit = byId.get(row.providerId);
-				if (hit === undefined) byId.set(row.providerId, { id: row.providerId, host: row.host, hasKey: false, via: state.cfg?.providerRoutes?.[row.providerId] ?? '' });
-				else if (hit.host === '' && row.host !== '') hit.host = row.host;
+				const hit = ensureRow(row.providerId);
+				if (hit.host === '' && row.host !== '') hit.host = row.host;
 			}
-			for (const pid of new Set(state.keyRoutes.values())) {
-				if (!byId.has(pid)) byId.set(pid, { id: pid, host: '', hasKey: true, via: state.cfg?.providerRoutes?.[pid] ?? '' });
-				else byId.get(pid).hasKey = true;
+			for (const [pid, host] of state.providerHosts ?? []) {
+				const hit = ensureRow(pid);
+				if (hit.host === '' && host !== '') hit.host = host;
+			}
+			for (const pid of state.keyRoutes.values()) {
+				ensureRow(pid).hasKey = true;
 			}
 			return [...byId.values()];
 		};
@@ -791,7 +758,6 @@ async function apply(ctx, config = {}) {
 				singleProxy: state.cfg?.singleProxy?.href ?? null,
 				default: state.cfg?.defaultVia ?? 'direct',
 				providerRoutes: state.cfg?.providerRoutes ?? {},
-				routes: state.cfg?.domainRules ?? [],
 				logRequests: state.cfg?.logRequests ?? true,
 				probeUrl: state.cfg?.probeUrl ?? 'https://www.gstatic.com/generate_204',
 				rows: state.rows.map((row) => ({ ...row })),
@@ -864,8 +830,8 @@ async function apply(ctx, config = {}) {
 				} catch {
 					probeUrl = new URL('https://www.gstatic.com/generate_204');
 				}
-				// kind: 'proxy'（按代理名/单代理测）、'provider'（按提供商 id）或
-				// 'model'（按模型 key）——后两者先看提供商显式走向，再落域名/默认
+				// kind: 'proxy'（按代理名/单代理/草稿地址测）、'provider'（按提供商 id）
+				// 或 'model'（按模型 key）——后两者先看提供商显式走向，再落默认走向
 				const probeRoute = async (decision, key) => {
 					if (decision.kind === 'direct') {
 						const result = await probeVia(probeUrl, null, state.originalFetch ?? globalThis.fetch);
@@ -877,13 +843,24 @@ async function apply(ctx, config = {}) {
 					writeJson(res, 200, { ok: result.ok, key, via: decision.name, ...result });
 				};
 				if (body.kind === 'proxy') {
+					// 优先用卡片传来的**草稿地址**——「添加代理」后无需保存即可测试
 					let url = null;
-					try {
-						if (body.name === '(default)' || body.name === 'proxy') url = state.cfg?.singleProxy ?? state.cfg?.proxies.get('default') ?? null;
-						else url = state.cfg?.proxies.get(String(body.name)) ?? null;
-					} catch { /* url 保持 null */ }
+					let message = null;
+					if (typeof body.url === 'string' && body.url.trim() !== '') {
+						try {
+							url = normalizeProxyUrl(body.url, `${TAG} /test`);
+						} catch (err) {
+							message = err?.message ?? String(err);
+						}
+					} else {
+						try {
+							if (body.name === '(default)' || body.name === 'proxy') url = state.cfg?.singleProxy ?? state.cfg?.proxies.get('default') ?? null;
+							else url = state.cfg?.proxies.get(String(body.name)) ?? null;
+						} catch { /* url 保持 null */ }
+						if (!url) message = '未知代理';
+					}
 					if (!url) {
-						writeJson(res, 200, { ok: false, key: String(body.name ?? ''), message: '未知代理' });
+						writeJson(res, 200, { ok: false, key: String(body.name ?? ''), message });
 						return;
 					}
 					const dispatcher = pool.get(url);
@@ -893,17 +870,17 @@ async function apply(ctx, config = {}) {
 				}
 				if (body.kind === 'provider') {
 					const pid = String(body.key ?? '');
-					const providerDecision = state.providerDecisions.get(pid);
-					if (providerDecision !== undefined) {
-						await probeRoute(providerDecision, pid);
+					const known = state.providerDecisions.has(pid)
+						|| state.rows.some((r) => r.providerId === pid)
+						|| state.providerHosts.has(pid);
+					if (!known) {
+						writeJson(res, 200, { ok: false, key: pid, message: '未知提供商' });
 						return;
 					}
-					const host = state.rows.find((r) => r.providerId === pid)?.host ?? '';
-					if (!host) {
-						writeJson(res, 200, { ok: false, key: pid, message: '未知提供商（不在模型目录中且未设置走向）' });
-						return;
-					}
-					await probeRoute(state.decide ? state.decide(host) : { kind: 'direct' }, pid);
+					// 无显式走向 → 默认走向（v0.4.1：不再报「未知」）
+					const decision = state.providerDecisions.get(pid)
+						?? (state.decide ? state.decide() : { kind: 'direct' });
+					await probeRoute(decision, pid);
 					return;
 				}
 				if (body.kind === 'model') {
@@ -914,7 +891,7 @@ async function apply(ctx, config = {}) {
 					}
 					const providerDecision = state.providerDecisions.get(row.providerId);
 					const decision = providerDecision !== undefined ? providerDecision
-						: (state.decide ? state.decide(row.host) : { kind: 'direct' });
+						: (state.decide ? state.decide() : { kind: 'direct' });
 					await probeRoute(decision, row.key);
 					return;
 				}
@@ -949,8 +926,8 @@ async function apply(ctx, config = {}) {
 						{ op: 'set', path: ['proxies'], value: parsed.proxies && typeof parsed.proxies === 'object' && !Array.isArray(parsed.proxies) ? parsed.proxies : {} },
 						{ op: 'set', path: ['default'], value: typeof parsed.default === 'string' ? parsed.default : 'direct' },
 						{ op: 'set', path: ['providerRoutes'], value: providerRoutes },
-						{ op: 'set', path: ['routes'], value: Array.isArray(parsed.routes) ? parsed.routes : [] },
 						{ op: 'set', path: ['logRequests'], value: parsed.logRequests !== false },
+						{ op: 'set', path: ['probeUrl'], value: typeof parsed.probeUrl === 'string' && parsed.probeUrl ? parsed.probeUrl : 'https://www.gstatic.com/generate_204' },
 					];
 					const seam = requireSeam(res);
 					if (!seam) return;

@@ -1,4 +1,4 @@
-// dsh-proxy-routes —— 设置页卡片：代理池 / 按提供商（账号）路由 / 域名规则 / 测试连接。
+// dsh-proxy-routes —— 设置页卡片：代理池 / 按提供商（账号）路由 / 测试连接。
 //
 // 数据面：卡片不直接读写 settings 传输，而是走本插件 host 侧的同源回环桥
 // /api/dsh-proxy-routes/settings/*（describe / mutate / test / migrate）。
@@ -24,11 +24,6 @@ export interface ProviderRow {
 	via: string
 }
 
-export interface DomainRule {
-	domains: string[]
-	via: string
-}
-
 export interface DescribeValue {
 	mode: 'file' | 'settings'
 	configFile: string | null
@@ -37,7 +32,6 @@ export interface DescribeValue {
 	singleProxy: string | null
 	default: string
 	providerRoutes: Record<string, string>
-	routes: DomainRule[]
 	logRequests: boolean
 	probeUrl: string
 	rows: ModelRow[]
@@ -259,16 +253,14 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 
 	const setProviderVia = (pid: string, via: string) => patch({ providerRoutes: { ...draft.providerRoutes, [pid]: via } })
 
-	const setRule = (index: number, rule: Partial<DomainRule>) => {
-		const routes = draft.routes.map((r, i) => (i === index ? { ...r, ...rule } : r))
-		patch({ routes })
-	}
-	const addRule = () => patch({ routes: [...draft.routes, { domains: [''], via: 'direct' }] })
-	const removeRule = (index: number) => patch({ routes: draft.routes.filter((_, i) => i !== index) })
-
 	const runTest = async (kind: 'proxy' | 'provider', key: string) => {
 		setTests((prev) => ({ ...prev, [key]: { pending: true } }))
-		const outcome = await postJson<TestOutcome & { ok: boolean }>('/test', { kind, name: key, key }).catch(() => ({ ok: false, key, message: 'network error' }))
+		const body: Record<string, unknown> = { kind, key, name: key }
+		if (kind === 'proxy') {
+			// 传**草稿地址**：新添加、尚未保存的代理也能立即测试
+			body.url = key === '(default)' ? draft.singleProxy ?? '' : draft.proxies[key] ?? ''
+		}
+		const outcome = await postJson<TestOutcome & { ok: boolean }>('/test', body).catch(() => ({ ok: false, key, message: 'network error' }))
 		setTests((prev) => ({ ...prev, [key]: { ...outcome, pending: false } }))
 	}
 
@@ -299,9 +291,6 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 		for (const [name, url] of Object.entries(draft.proxies)) {
 			if (name.trim() && url.trim()) cleanedProxies[name.trim()] = url.trim()
 		}
-		const cleanedRoutes = draft.routes
-			.map((r) => ({ domains: r.domains.flatMap((d) => String(d).split(',')).map((d) => d.trim()).filter(Boolean), via: r.via }))
-			.filter((r) => r.domains.length > 0)
 		const cleanedProviderRoutes: Record<string, string> = {}
 		for (const [pid, via] of Object.entries(draft.providerRoutes)) {
 			if (via !== undefined && via !== null && via !== '') cleanedProviderRoutes[pid] = via
@@ -311,7 +300,6 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 			{ op: 'set', path: ['singleProxy'], value: draft.singleProxy?.trim() ?? '' },
 			{ op: 'set', path: ['default'], value: draft.default },
 			{ op: 'set', path: ['providerRoutes'], value: cleanedProviderRoutes },
-			{ op: 'set', path: ['routes'], value: cleanedRoutes },
 			{ op: 'set', path: ['logRequests'], value: draft.logRequests !== false },
 			{ op: 'set', path: ['probeUrl'], value: draft.probeUrl },
 		]
@@ -389,31 +377,12 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 							disabled={readOnly}
 							onChange={(e) => setProviderVia(provider.id, e.target.value)}
 							aria-label={t('via')}>
-							<option value="">{t('followDomain')}</option>
+							<option value="">{t('rule')}</option>
 							{viaOptions.map((via) => <option key={via} value={via}>{viaLabel(via)}</option>)}
 						</select>
 						{testBadge(tests[provider.id])}
 					</div>
 				))}
-			</div>
-
-			<div style={S.section}>
-				<span style={S.sectionTitle}>{t('domainRules')}</span>
-				{draft.routes.map((rule, index) => (
-					<div key={index} style={S.row}>
-						<input style={{ ...S.input, ...(readOnly ? S.disabled : {}) }} value={rule.domains.join(',')} disabled={readOnly}
-							onChange={(e) => setRule(index, { domains: e.target.value.split(',') })}
-							aria-label={t('domains')} placeholder="anthropic.com, claude.ai" />
-						<select style={{ ...S.input, ...S.inputNarrow, ...(readOnly ? S.disabled : {}) }} value={rule.via} disabled={readOnly}
-							onChange={(e) => setRule(index, { via: e.target.value })} aria-label={t('via')}>
-							{viaOptions.map((via) => <option key={via} value={via}>{viaLabel(via)}</option>)}
-						</select>
-						<button style={{ ...S.button, ...(readOnly ? S.disabled : {}) }} disabled={readOnly} onClick={() => removeRule(index)}>{t('remove')}</button>
-					</div>
-				))}
-				<div style={S.row}>
-					<button style={{ ...S.button, ...(readOnly ? S.disabled : {}) }} disabled={readOnly} onClick={addRule}>{t('addRule')}</button>
-				</div>
 			</div>
 
 			<div style={S.section}>
