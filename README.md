@@ -232,13 +232,13 @@ DSH 启动时由官方 dsh-http-proxy 读取这三个环境变量，装一个进
 git clone https://github.com/liqiaohuia/dsh-proxy-routes.git
 cd dsh-proxy-routes
 pnpm install          # devDependencies：undici/react/esbuild/typescript
-node test-plugin.mjs  # 40 项测试（网络用例需本机 50939/50018 两个 SOCKS5 代理在运行）
+node test-plugin.mjs  # 47 项测试（网络用例需本机 50939/50018 两个 SOCKS5 代理在运行）
 ```
 
 - **开发机用 link 安装**：`dsh plugin add <本目录>` 放的是指向本目录的 `link:` 依赖——改 host 侧代码（`index.mjs` / `transport.mjs` / `catalog.mjs`）后重启即生效；改客户端（`src/client/`）后要 `pnpm build` 重建 `lib/client.js` 再重启
 - 开发机**重装前先完全退出 DSH Desktop**（见常见问题的 EPERM 条目）
 - **发布到 npm**：`npm login`（2FA 用 passkey / Windows Hello）→ `npm publish`；发布物为 8 个文件（`npm pack` 可预览，含 `lib/client.js`）
-- **上架 dshmarket**：向 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 提 PR（在 plugins.json 里加一条本插件的 npm 包信息），合并后约一天内出现在市场
+- **上架 dshmarket / awesome 列表**：向 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 提 PR，在 `data/plugins/` 下新建一个独立 YAML 文件（如 `liqiaohuia__dsh-proxy-routes.yml`），字段为 `url`（仓库地址）、`name`（owner/repo）、`category`（合法值见其 contributing.md）、`description`（en 必填、zh 可选），可选 `tarball:` 指向 GitHub Release 的 `.tgz`；两个 README 与市场页面由条目文件自动生成，勿手改。npm 包经 `repository` 字段自动关联并显示下载量；仓库需打上 `dsh-plugin` topic
 - **安装方式二（免 pnpm）**：把仓库复制到 profile 下，在 `cordis.patch.yml` 里加：
 
   ```yaml
