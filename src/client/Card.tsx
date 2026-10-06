@@ -31,6 +31,9 @@ export interface DescribeValue {
 	proxies: Record<string, string>
 	singleProxy: string | null
 	default: string
+	directMode: 'enforce' | 'passthrough'
+	webToolsEnabled: boolean
+	webToolsProxy: string
 	providerRoutes: Record<string, string>
 	logRequests: boolean
 	probeUrl: string
@@ -263,12 +266,16 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 
 	const setProviderVia = (pid: string, via: string) => patch({ providerRoutes: { ...draft.providerRoutes, [pid]: via } })
 
-	const runTest = async (kind: 'proxy' | 'provider', key: string) => {
+	const runTest = async (kind: 'proxy' | 'provider' | 'webtools', key: string) => {
 		setTests((prev) => ({ ...prev, [key]: { pending: true } }))
 		const body: Record<string, unknown> = { kind, key, name: key }
 		if (kind === 'proxy') {
 			// 传**草稿地址**：新添加、尚未保存的代理也能立即测试
 			body.url = key === '(default)' ? draft.singleProxy ?? '' : proxyRows.find((r) => r.name === key)?.url ?? ''
+		}
+		if (kind === 'webtools') {
+			// 同理：联网工具代理的草稿 host:port 也能立即测试（v0.5.0）
+			body.url = draft.webToolsProxy
 		}
 		const outcome = await postJson<TestOutcome & { ok: boolean }>('/test', body).catch(() => ({ ok: false, key, message: 'network error' }))
 		setTests((prev) => ({ ...prev, [key]: { ...outcome, pending: false } }))
@@ -285,6 +292,15 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 		if (readOnly) return
 		setSaving(true)
 		setSaveMsg(null)
+		// v0.5.0：联网工具代理格式校验（host:port，不带协议前缀）
+		const webToolsHost = (draft.webToolsProxy ?? '').trim()
+		const webToolsPort = Number(webToolsHost.match(/:(\d{1,5})$/)?.[1] ?? 0)
+		if (draft.webToolsEnabled === true
+			&& (!(/^\[([^\]]+)\]:(\d{1,5})$/.test(webToolsHost) || /^[^:/[\]]+:(\d{1,5})$/.test(webToolsHost)) || webToolsPort < 1 || webToolsPort > 65535)) {
+			setSaving(false)
+			setSaveMsg(t('webToolsBadFormat'))
+			return
+		}
 		// 池行汇成 Record：空名/空地址的行跳过（同名后行覆盖前行）
 		const cleanedProxies: Record<string, string> = {}
 		for (const row of proxyRows) {
@@ -300,9 +316,12 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 			{ op: 'set', path: ['proxies'], value: cleanedProxies },
 			{ op: 'set', path: ['singleProxy'], value: draft.singleProxy?.trim() ?? '' },
 			{ op: 'set', path: ['default'], value: draft.default },
+			{ op: 'set', path: ['directMode'], value: draft.directMode === 'passthrough' ? 'passthrough' : 'enforce' },
 			{ op: 'set', path: ['providerRoutes'], value: cleanedProviderRoutes },
 			{ op: 'set', path: ['logRequests'], value: draft.logRequests !== false },
 			{ op: 'set', path: ['probeUrl'], value: draft.probeUrl },
+			{ op: 'set', path: ['webToolsEnabled'], value: draft.webToolsEnabled === true },
+			{ op: 'set', path: ['webToolsProxy'], value: webToolsHost === '' ? '127.0.0.1:10000' : webToolsHost },
 		]
 		const result = await postJson<{ ok: boolean; message?: string }>('/mutate', { ops }).catch(() => ({ ok: false, message: 'network error' }))
 		setSaving(false)
@@ -355,6 +374,21 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 			</div>
 
 			<div style={S.section}>
+				<span style={S.sectionTitle}>{t('directModeTitle')}</span>
+				<span style={S.hint}>{t('directModeHint')}</span>
+				<label style={S.row}>
+					<input type="radio" name="dsh-proxy-routes-direct-mode" checked={draft.directMode !== 'passthrough'} disabled={readOnly}
+						onChange={() => patch({ directMode: 'enforce' })} />
+					<span style={S.hint}>{t('directModeEnforce')}</span>
+				</label>
+				<label style={S.row}>
+					<input type="radio" name="dsh-proxy-routes-direct-mode" checked={draft.directMode === 'passthrough'} disabled={readOnly}
+						onChange={() => patch({ directMode: 'passthrough' })} />
+					<span style={S.hint}>{t('directModePassthrough')}</span>
+				</label>
+			</div>
+
+			<div style={S.section}>
 				<span style={S.sectionTitle}>{t('providerRoutes')}</span>
 				<span style={S.hint}>{t('providerHint')}</span>
 				{draft.providers.length === 0 && <span style={S.hint}>{t('emptyProviders')}</span>}
@@ -376,6 +410,36 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 						{testBadge(tests[provider.id])}
 					</div>
 				))}
+			</div>
+
+			<div style={S.section}>
+				<span style={S.sectionTitle}>{t('webToolsTitle')}</span>
+				<label style={S.row}>
+					<input type="checkbox" checked={draft.webToolsEnabled === true} disabled={readOnly}
+						onChange={(e) => patch({ webToolsEnabled: e.target.checked })} />
+					<span style={S.hint}>{t('webToolsEnable')}</span>
+				</label>
+				{draft.webToolsEnabled === true && (
+					<div style={S.row}>
+						<span style={{
+							...S.input,
+							flex: 'none',
+							width: 'auto',
+							display: 'inline-flex',
+							alignItems: 'center',
+							borderRadius: '6px 0 0 6px',
+							borderRight: 'none',
+							color: 'var(--dsw-alias-label-tertiary,#6b7280)',
+							whiteSpace: 'nowrap',
+							...(readOnly ? S.disabled : {}),
+						}}>http://</span>
+						<input style={{ ...S.input, borderRadius: '0 6px 6px 0', ...(readOnly ? S.disabled : {}) }} value={draft.webToolsProxy ?? ''} disabled={readOnly}
+							onChange={(e) => patch({ webToolsProxy: e.target.value })} placeholder="127.0.0.1:10000" aria-label={t('webToolsHost')} />
+						<button style={S.button} onClick={() => void runTest('webtools', '(webtools)')}>{t('test')}</button>
+						{testBadge(tests['(webtools)'])}
+					</div>
+				)}
+				<span style={S.hint}>{t('webToolsHint')}</span>
 			</div>
 
 			<div style={S.section}>

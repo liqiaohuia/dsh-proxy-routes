@@ -1,9 +1,12 @@
-// dsh-proxy-routes —— v0.4 测试脚本（无依赖，直接 node 运行）。
+// dsh-proxy-routes —— v0.5 测试脚本（无依赖，直接 node 运行）。
 // 覆盖：require 兼容回归（防桌面版 invalid plugin 事故）/ 文件模式加载 /
 // 双代理池路由 / 直连 / Config schema 导出（0.1.7 volatile 标记）/
 // 0.1.7 settings 模式（无 register）+ 按提供商（密钥）分流——同域双账号
 // 各走各路的端到端回归 / 密钥不落日志（安全规则）/ normalizeProxyUrl（单元）/
-// dispatcher 池缓存（单元）/ 热重载 / 卸载还原。
+// dispatcher 池缓存（单元）/ 热重载 / 卸载还原 /
+// v0.5.0：绝对直连（enforce 绕过原始 fetch）与 passthrough（回落原始 fetch）、
+// directMode / webTools 配置字段（volatile + describe 载荷）、
+// /test webtools（http-only 草稿探测）。
 //
 // 运行：node test-plugin.mjs
 // 前置：本机 50939 / 50018 两个 SOCKS5 代理在监听（xray）；未监听时网络用例报 FAIL。
@@ -150,6 +153,10 @@ try {
 	check('Config schema：routes 字段已删除（v0.4.1 域名分流移除）', schema?.dict?.routes === undefined);
 	check('Config schema：configFile / trustedOrigins 非 volatile（改它们应重挂载）',
 		!schema?.dict?.configFile?.meta?.volatile && !schema?.dict?.trustedOrigins?.meta?.volatile);
+	check('Config schema：directMode / webToolsEnabled / webToolsProxy 为 volatile（v0.5.0）',
+		schema?.dict?.directMode?.meta?.volatile === true
+		&& schema?.dict?.webToolsEnabled?.meta?.volatile === true
+		&& schema?.dict?.webToolsProxy?.meta?.volatile === true);
 }
 
 /* —— 9b. 集成：0.1.7 settings 模式（seam 无 register）+ 按提供商（密钥）分流 ——
@@ -165,6 +172,7 @@ try {
 	process.env.DSH_HOME = HOME2; // 无配置文件 → settings 模式
 
 	const webRoutes = [];
+	let directModeSetting = 'enforce'; // v0.5.0：阶段 A 默认（绝对直连）；阶段 B 翻为 passthrough
 	const settingsRows = () => ([
 		{
 			ns: 'proxy-routes',
@@ -172,6 +180,7 @@ try {
 				proxies: { main: 'socks5://127.0.0.1:50939' },
 				providerRoutes: { claude1: 'main', claude2: 'direct' },
 				default: 'direct',
+				directMode: directModeSetting,
 				logRequests: true,
 			},
 		},
@@ -204,6 +213,12 @@ try {
 		logger: ctx.logger,
 	};
 
+	// v0.5.0：计数「原始 fetch」调用——绝对直连（enforce）与走代理都应走自建
+	// dispatcher（undici 路径），只有 passthrough 直连才回落 originalFetch。
+	const trueFetch = globalThis.fetch; // 测试 6 已还原的真实 fetch
+	let originalFetchCalls = 0;
+	globalThis.fetch = function countingFetch(...args) { originalFetchCalls += 1; return trueFetch(...args); };
+
 	await apply(ctx2, {});
 	await delay(300); // rebuildKeyRoutes 异步完成
 	check('0.1.7 settings（无 register）：桥接 4 条路由已挂载（migrate 已移除）', webRoutes.filter((r) => r.kind === 'exact').length === 4);
@@ -220,6 +235,7 @@ try {
 	check('无密钥请求：未命中提供商 → 默认直连 403', r3 !== null && r3.status === 403);
 	check('路由日志：claude1=>main（提供商名入日志）', logs.some((l) => l.includes('claude1=>main:socks5://127.0.0.1:50939')));
 	check('安全回归：密钥值绝不落日志', !logs.some((l) => l.includes(KEY1) || l.includes(KEY2)));
+	check('v0.5.0 绝对直连（默认 enforce）：direct 与代理请求全部绕过原始 fetch', originalFetchCalls === 0);
 
 	// bridge describe：providers 行（hasKey + host），且不含密钥本体
 	const describeRoute = webRoutes.find((r) => r.path.endsWith('/describe'));
@@ -240,6 +256,10 @@ try {
 			&& byId.claude3?.hasKey === false && byId.claude3?.host === 'open.bigmodel.cn');
 		check('bridge describe：不含密钥本体', !resMock.body.includes(KEY1) && !resMock.body.includes(KEY2));
 		check('bridge describe：mode 为 settings（默认姿态）', described?.value?.mode === 'settings');
+		check('bridge describe：v0.5.0 新字段（directMode=enforce / webTools 关闭+默认地址）',
+			described?.value?.directMode === 'enforce'
+			&& described?.value?.webToolsEnabled === false
+			&& described?.value?.webToolsProxy === '127.0.0.1:10000');
 
 		// /test kind=proxy 带草稿地址：未保存的新代理也能立即测试（v0.4.1）
 		const testRoute = webRoutes.find((r) => r.path.endsWith('/test'));
@@ -261,12 +281,34 @@ try {
 			const provPayload = JSON.parse(rProv.body);
 			check('/test provider：无显式走向的提供商回退默认走向（不报未知）',
 				provPayload.via === 'direct' && provPayload.message !== '未知提供商');
+			// v0.5.0：联网工具代理（webtools）——草稿可测 + http-only 约束
+			const rWt1 = resOf();
+			await testRoute.handler(reqOf({ kind: 'webtools', name: '(webtools)', url: 'socks5://127.0.0.1:50939' }), rWt1);
+			const wt1 = JSON.parse(rWt1.body);
+			check('/test webtools：socks5:// 前缀直接拒绝（官方仅支持 http:// 代理）',
+				wt1.ok === false && String(wt1.message).includes('不支持协议前缀'));
+			const rWt2 = resOf();
+			await testRoute.handler(reqOf({ kind: 'webtools', name: '(webtools)', url: '127.0.0.1:1' }), rWt2);
+			const wt2 = JSON.parse(rWt2.body);
+			check('/test webtools：无代理监听的端口探测不通（host:port 草稿可测）', wt2.ok === false);
 		} else {
 			check('bridge /test 路由存在', false);
 		}
 	} else {
 		check('bridge describe 路由存在', false);
 	}
+
+	/* —— v0.5.0 阶段 B：directMode=passthrough——「直连」回落原始 fetch（不干预
+	   DSH 全局策略），代理请求仍走插件自己的 dispatcher。—— */
+	directModeSetting = 'passthrough';
+	for (const d of dispose2.splice(0)) { try { d?.(); } catch { /* ignore */ } }
+	await apply(ctx2, {});
+	await delay(300);
+	const before = originalFetchCalls;
+	try { await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY2, 'content-type': 'application/json' }, body: '{}' }); } catch { /* ignore */ }
+	check('directMode=passthrough：直连请求回落原始 fetch（不干预全局策略）', originalFetchCalls === before + 1);
+	try { await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY1, 'content-type': 'application/json' }, body: '{}' }); } catch { /* ignore */ }
+	check('directMode=passthrough：代理请求仍走插件 dispatcher（不经过原始 fetch）', originalFetchCalls === before + 1);
 
 	for (const d of dispose2.splice(0)) { try { d?.(); } catch { /* ignore */ } }
 	delete process.env.DPR_TEST_K1;

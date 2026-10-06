@@ -28,10 +28,11 @@
 
 import { readFile } from 'node:fs/promises';
 import { existsSync, watch, watchFile, unwatchFile } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { createRequire } from 'node:module';
 import Schema from '@deepseek-ai/schemastery';
-import { ensureTransport, getUndici, normalizeProxyUrl, DispatcherPool, probeVia } from './transport.mjs';
+import { ensureTransport, getUndici, normalizeProxyUrl, makeProxyDispatcher, DispatcherPool, probeVia } from './transport.mjs';
 import { ensurePiAiCatalog, listModels } from './catalog.mjs';
 
 const name = 'dsh-proxy-routes';
@@ -97,15 +98,54 @@ function normalizeRawConfig(raw, label) {
 	for (const [pid, via] of Object.entries(providerRoutes)) {
 		if (typeof via !== 'string' || via.trim() === '') delete providerRoutes[pid];
 	}
+	// v0.5.0：直连的语义——enforce=绝对直连（本插件用自建 dispatcher 接管，
+	// 无视 DSH 全局代理）；passthrough=不干预（回落 DSH 的 HTTP(S)_PROXY 策略）
+	const directMode = raw.directMode === undefined ? 'enforce' : String(raw.directMode);
+	if (directMode !== 'enforce' && directMode !== 'passthrough') {
+		throw new Error(`${TAG} ${label} 的 "directMode" 必须是 "enforce" 或 "passthrough"`);
+	}
+	// v0.5.0：内置联网工具代理（web_fetch 抓取 / MCP 子进程 / 未认领流量）——
+	// 热装官方 dsh-http-proxy 的全局出站策略；仅支持 http://（前缀由插件补齐）
+	const webToolsEnabled = raw.webToolsEnabled === true;
+	let webToolsProxy = typeof raw.webToolsProxy === 'string' ? raw.webToolsProxy.trim() : '';
+	if (webToolsProxy === '') webToolsProxy = '127.0.0.1:10000';
+	if (webToolsEnabled) webToolsProxy = validateWebToolsHost(webToolsProxy, label);
 	return {
 		proxies,
 		singleProxy,
 		defaultVia,
 		providerRoutes,
 		modelRoutes,
+		directMode,
+		webToolsEnabled,
+		webToolsProxy,
 		logRequests: raw.logRequests !== false,
 		probeUrl: typeof raw.probeUrl === 'string' && raw.probeUrl.trim() !== '' ? raw.probeUrl.trim() : 'https://www.gstatic.com/generate_204',
 	};
+}
+
+/**
+ * 校验「内置联网工具代理」地址（v0.5.0）：host:port 形式，不允许协议前缀——
+ * 官方 dsh-http-proxy 仅支持 http:// 代理（SOCKS 会被拒收并保持直连），
+ * 前缀由本插件统一补齐。
+ * @param {unknown} raw 原始值
+ * @param {string} label 出错信息里的来源描述
+ * @returns {string} 校验后的值
+ */
+function validateWebToolsHost(raw, label) {
+	const value = String(raw).trim();
+	if (value.includes('://')) {
+		throw new Error(`${TAG} ${label} 的 "webToolsProxy" 不支持协议前缀（仅支持 http:// 代理，前缀由插件自动添加）: ${value}`);
+	}
+	const match = /^\[([^\]]+)\]:(\d{1,5})$/.exec(value) ?? /^([^:/[\]]+):(\d{1,5})$/.exec(value);
+	if (!match) {
+		throw new Error(`${TAG} ${label} 的 "webToolsProxy" 必须是 host:port 形式（如 127.0.0.1:10000）`);
+	}
+	const port = Number(match[2]);
+	if (!(port >= 1 && port <= 65535)) {
+		throw new Error(`${TAG} ${label} 的 "webToolsProxy" 端口超出范围（1-65535）: ${value}`);
+	}
+	return value;
 }
 
 /**
@@ -247,10 +287,13 @@ const CONFIG_FIELDS = {
 	proxies: Schema.dict(Schema.string()).default({}).volatile(),
 	singleProxy: Schema.string().default('').volatile(),
 	default: Schema.string().default('direct').volatile(),
+	directMode: Schema.string().default('enforce').volatile(),
 	providerRoutes: Schema.dict(Schema.string()).default({}).volatile(),
 	modelRoutes: Schema.dict(Schema.string()).default({}).volatile(),
 	logRequests: Schema.boolean().default(true).volatile(),
 	probeUrl: Schema.string().default('https://www.gstatic.com/generate_204').volatile(),
+	webToolsEnabled: Schema.boolean().default(false).volatile(),
+	webToolsProxy: Schema.string().default('127.0.0.1:10000').volatile(),
 };
 export const Config = Schema.object(CONFIG_FIELDS);
 
@@ -260,11 +303,49 @@ function makeRegisterSchema() {
 		singleProxy: Schema.string().default(''),
 		proxies: Schema.dict(Schema.string()).default({}),
 		default: Schema.string().default('direct'),
+		directMode: Schema.string().default('enforce'),
 		providerRoutes: Schema.dict(Schema.string()).default({}),
 		modelRoutes: Schema.dict(Schema.string()).default({}),
 		logRequests: Schema.boolean().default(true),
 		probeUrl: Schema.string().default('https://www.gstatic.com/generate_204'),
+		webToolsEnabled: Schema.boolean().default(false),
+		webToolsProxy: Schema.string().default('127.0.0.1:10000'),
 	});
+}
+
+/**
+ * 加载**宿主进程正在使用的** @deepseek-ai/dsh-http-proxy 实例（v0.5.0）。
+ * 官方的 web_fetch 按同一实例的 proxyRouteFor 分流——拿到第二份拷贝时，在其上
+ * 安装的全局策略 web_fetch 根本看不见。因此优先从宿主安装树解析（Electron 的
+ * resourcesPath / 沿当前进程入口向上回溯），普通动态 import 仅作兜底。
+ * @returns {Promise<{installProxyFromEnvironment: Function} | null>}
+ */
+async function loadHttpProxyModule() {
+	const roots = [];
+	try {
+		if (typeof process.resourcesPath === 'string' && process.resourcesPath) roots.push(join(process.resourcesPath, 'app'));
+	} catch { /* 非 Electron 进程 */ }
+	try {
+		let dir = dirname(resolve(process.argv[1] ?? process.argv[0] ?? '.'));
+		for (let i = 0; i < 12; i++) {
+			if (existsSync(join(dir, 'node_modules', '@deepseek-ai', 'dsh-http-proxy', 'package.json'))) { roots.push(dir); break; }
+			const parent = dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
+		}
+	} catch { /* ignore */ }
+	for (const root of roots) {
+		try {
+			const requireFromRoot = createRequire(join(root, 'package.json'));
+			const mod = requireFromRoot('@deepseek-ai/dsh-http-proxy');
+			if (mod && typeof mod.installProxyFromEnvironment === 'function') return mod;
+		} catch { /* 试下一候选或兜底 */ }
+	}
+	try {
+		const mod = await import('@deepseek-ai/dsh-http-proxy');
+		if (mod && typeof mod.installProxyFromEnvironment === 'function') return mod;
+	} catch { /* 全部失败：调用方降级 */ }
+	return null;
 }
 
 /** volatile 字段到达 apply 时是引用（`.get()` 读取）；这里统一解包为普通对象。 */
@@ -403,6 +484,13 @@ async function apply(ctx, config = {}) {
 						}
 						log.warn(`${TAG} 代理 ${decision.name} 的 dispatcher 尚未就绪，本次直连`);
 					}
+					if (decision.kind === 'direct' && state.cfg.directMode === 'enforce') {
+						// v0.5.0：绝对直连——自建 dispatcher 发请求，官方全局代理被彻底
+						// 旁路；不打路由日志（logRequests 只覆盖走代理的请求）
+						const undici = getUndici();
+						const dispatcher = directAgent();
+						if (undici && dispatcher) return undici.fetch(url, { ...init, dispatcher });
+					}
 				}
 				if (url) return state.originalFetch.call(this, input, init);
 				// Request 对象输入
@@ -427,6 +515,22 @@ async function apply(ctx, config = {}) {
 								return undici.fetch(reqUrl, { ...mergedInit, dispatcher });
 							}
 						}
+						if (decision.kind === 'direct' && state.cfg.directMode === 'enforce') {
+							// v0.5.0：绝对直连（Request 对象输入，同上）——自建 dispatcher，
+							// 官方全局代理被彻底旁路
+							const undici = getUndici();
+							const dispatcher = directAgent();
+							if (undici && dispatcher) {
+								const mergedInit = {
+									method: (init && init.method) || input.method,
+									headers: (init && init.headers) || input.headers,
+									body: init && init.body !== undefined ? init.body : input.body,
+									signal: (init && init.signal) || input.signal,
+									duplex: 'half',
+								};
+								return undici.fetch(reqUrl, { ...mergedInit, dispatcher });
+							}
+						}
 					}
 				}
 			} catch {
@@ -448,6 +552,69 @@ async function apply(ctx, config = {}) {
 		state.originalFetch = null;
 	};
 
+	/* —— v0.5.0：绝对直连（directMode=enforce）专用的自建 dispatcher ——
+	 * 走它发的请求在 dispatcher 层就绕开官方 dsh-http-proxy 装的全局策略，
+	 * 因此「直连」= 绝对直连，不再被全局代理或其他代理插件干扰。 */
+	let directDispatcher = null;
+	const directAgent = () => {
+		const undici = getUndici();
+		if (!undici) return null;
+		if (directDispatcher === null) directDispatcher = new undici.Agent();
+		return directDispatcher;
+	};
+
+	/* —— v0.5.0：内置联网工具代理（web_fetch / MCP 子进程 / 未认领流量）——
+	 * 官方 dsh-http-proxy 导出 installProxyFromEnvironment(env, report)，可
+	 * 直接**热装**其全局出站策略并拿回 disposer——不需要系统环境变量、不需要
+	 * 重启 DSH；关闭或卸载本插件时调用 disposer 原样还原。必须使用宿主进程
+	 * 正在使用的同一模块实例（见 loadHttpProxyModule），否则 web_fetch 察觉不到。 */
+	let webToolsTimer = null;
+	let webToolsDispose = null;
+	let webToolsActive = null;
+	let webToolsStopped = false;
+	let webToolsChain = Promise.resolve();
+	const runWebTools = async (wanted) => {
+		if (webToolsStopped || webToolsActive === wanted) return;
+		if (webToolsDispose) {
+			const restore = webToolsDispose;
+			webToolsDispose = null;
+			try { await restore(); } catch { /* ignore */ }
+		}
+		webToolsActive = wanted;
+		if (wanted === null) {
+			log.info(`${TAG} 内置联网工具代理已关闭（DSH 原全局出站策略已还原）`);
+			return;
+		}
+		try {
+			const mod = await loadHttpProxyModule();
+			if (!mod) {
+				log.error(`${TAG} 未能加载宿主的 @deepseek-ai/dsh-http-proxy：内置联网工具代理暂不可用（其余功能不受影响）`);
+				return;
+			}
+			const envMap = new Map([
+				['http_proxy', { value: wanted }],
+				['https_proxy', { value: wanted }],
+			]);
+			const dispose = await mod.installProxyFromEnvironment(envMap, (message) => log.warn(`${TAG} 联网工具代理：${message}`));
+			if (webToolsStopped) {
+				try { await dispose(); } catch { /* ignore */ }
+				return;
+			}
+			webToolsDispose = dispose;
+			log.info(`${TAG} 内置联网工具代理已生效：web_fetch / MCP 子进程 / 未认领流量 → ${wanted}（关闭或卸载时自动还原）`);
+		} catch (err) {
+			log.error(`${TAG} 安装内置联网工具代理失败: ${err?.message ?? err}`);
+		}
+	};
+	const scheduleWebTools = () => {
+		const wanted = state.cfg && state.cfg.webToolsEnabled === true ? `http://${state.cfg.webToolsProxy}` : null;
+		if (webToolsTimer) clearTimeout(webToolsTimer);
+		webToolsTimer = setTimeout(() => {
+			webToolsTimer = null;
+			webToolsChain = webToolsChain.then(() => runWebTools(wanted)).catch(() => { /* ignore */ });
+		}, 50);
+	};
+
 	/* —— 配置应用 —— */
 	/** 把一份原始配置（文件或 settings 值）变成生效配置（normalize → 池重建 → 路由编译）。 */
 	const applyRawConfig = (raw, label, announce) => {
@@ -467,6 +634,7 @@ async function apply(ctx, config = {}) {
 		state.decide = routing.decide;
 		state.providerDecisions = routing.providerDecisions;
 		ensurePatched();
+		scheduleWebTools();
 		for (const message of routing.unknownProxies) log.warn(`${TAG} ${message}`);
 		if (announce) {
 			const viaLabel = (via) => via === 'direct' ? '直连' : via === 'proxy' ? '代理' : via;
@@ -731,6 +899,9 @@ async function apply(ctx, config = {}) {
 				proxies: Object.fromEntries([...state.cfg?.proxies.entries() ?? []].map(([n, u]) => [n, u.href])),
 				singleProxy: state.cfg?.singleProxy?.href ?? null,
 				default: state.cfg?.defaultVia ?? 'direct',
+				directMode: state.cfg?.directMode ?? 'enforce',
+				webToolsEnabled: state.cfg?.webToolsEnabled ?? false,
+				webToolsProxy: state.cfg?.webToolsProxy ?? '127.0.0.1:10000',
 				providerRoutes: state.cfg?.providerRoutes ?? {},
 				logRequests: state.cfg?.logRequests ?? true,
 				probeUrl: state.cfg?.probeUrl ?? 'https://www.gstatic.com/generate_204',
@@ -808,7 +979,10 @@ async function apply(ctx, config = {}) {
 				// 或 'model'（按模型 key）——后两者先看提供商显式走向，再落默认走向
 				const probeRoute = async (decision, key) => {
 					if (decision.kind === 'direct') {
-						const result = await probeVia(probeUrl, null, state.originalFetch ?? globalThis.fetch);
+						// v0.5.0：directMode=enforce 时用自建 dispatcher 探测（反映真实路径）
+						const enforce = state.cfg?.directMode === 'enforce';
+						const dispatcher = enforce ? directAgent() : null;
+						const result = await probeVia(probeUrl, dispatcher, state.originalFetch ?? globalThis.fetch);
 						writeJson(res, 200, { ok: result.ok, key, via: 'direct', ...result });
 						return;
 					}
@@ -840,6 +1014,29 @@ async function apply(ctx, config = {}) {
 					const dispatcher = pool.get(url);
 					const result = await probeVia(probeUrl, dispatcher, state.originalFetch ?? globalThis.fetch);
 					writeJson(res, 200, { ok: result.ok, key: String(body.name), ...result });
+					return;
+				}
+				if (body.kind === 'webtools') {
+					// v0.5.0：草稿 host:port 优先——未保存也能立即测试（仅支持 http:// 代理）
+					let message = null;
+					let url = null;
+					const host = typeof body.url === 'string' && body.url.trim() !== ''
+						? body.url.trim()
+						: (state.cfg?.webToolsProxy ?? '');
+					if (host === '') message = '未配置联网工具代理';
+					else if (host.includes('://')) message = '不支持协议前缀（仅支持 http:// 代理）';
+					else {
+						try { url = normalizeProxyUrl(`http://${host}`, `${TAG} /test(webtools)`); }
+						catch (err) { message = err?.message ?? String(err); }
+					}
+					if (!url) {
+						writeJson(res, 200, { ok: false, key: '(webtools)', message });
+						return;
+					}
+					const dispatcher = makeProxyDispatcher(url);
+					const result = await probeVia(probeUrl, dispatcher, state.originalFetch ?? globalThis.fetch);
+					try { dispatcher.close().catch(() => { /* ignore */ }); } catch { /* ignore */ }
+					writeJson(res, 200, { ok: result.ok, key: '(webtools)', ...result });
 					return;
 				}
 				if (body.kind === 'provider') {
@@ -886,6 +1083,18 @@ async function apply(ctx, config = {}) {
 			stopped = true;
 			unpatch();
 			pool.close();
+			if (directDispatcher) {
+				try { directDispatcher.close().catch(() => { /* ignore */ }); } catch { /* ignore */ }
+				directDispatcher = null;
+			}
+			// v0.5.0：还原官方全局出站策略（若内置联网工具代理已热装）
+			if (webToolsTimer) { clearTimeout(webToolsTimer); webToolsTimer = null; }
+			webToolsStopped = true;
+			if (webToolsDispose) {
+				const restore = webToolsDispose;
+				webToolsDispose = null;
+				void restore().catch(() => { /* ignore */ });
+			}
 			if (typeof state.watchStopper === 'function') {
 				try { state.watchStopper(); } catch { /* ignore */ }
 			}
