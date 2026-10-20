@@ -125,9 +125,11 @@ function normalizeRawConfig(raw, label) {
 }
 
 /**
- * 校验「内置联网工具代理」地址（v0.5.0）：host:port 形式，不允许协议前缀——
- * 官方 dsh-http-proxy 仅支持 http:// 代理（SOCKS 会被拒收并保持直连），
- * 前缀由本插件统一补齐。
+ * 校验「内置联网工具代理」地址（v0.5.0）：host:port；v0.5.1 起支持认证——
+ * user:pass@host:port。不允许协议前缀——官方 dsh-http-proxy 仅支持 http:// 代理
+ * （SOCKS 会被拒收并保持直连），前缀由本插件统一补齐。校验即 URL 解析：与运行时
+ * 拼出的最终地址（`http://${value}`）完全一致；密码中的特殊字符须 URL 编码
+ * （如 @ → %40、: → %3A），未编码时解析结果与用户意图不符会被直接拒绝。
  * @param {unknown} raw 原始值
  * @param {string} label 出错信息里的来源描述
  * @returns {string} 校验后的值
@@ -137,13 +139,18 @@ function validateWebToolsHost(raw, label) {
 	if (value.includes('://')) {
 		throw new Error(`${TAG} ${label} 的 "webToolsProxy" 不支持协议前缀（仅支持 http:// 代理，前缀由插件自动添加）: ${value}`);
 	}
-	const match = /^\[([^\]]+)\]:(\d{1,5})$/.exec(value) ?? /^([^:/[\]]+):(\d{1,5})$/.exec(value);
-	if (!match) {
-		throw new Error(`${TAG} ${label} 的 "webToolsProxy" 必须是 host:port 形式（如 127.0.0.1:10000）`);
+	let parsed;
+	try {
+		parsed = new URL(`http://${value}`);
+	} catch {
+		throw new Error(`${TAG} ${label} 的 "webToolsProxy" 必须是 host:port 或 user:pass@host:port 形式（IPv6 用 [::1]:port；密码特殊字符请 URL 编码，如 @ → %40）`);
 	}
-	const port = Number(match[2]);
-	if (!(port >= 1 && port <= 65535)) {
-		throw new Error(`${TAG} ${label} 的 "webToolsProxy" 端口超出范围（1-65535）: ${value}`);
+	if (!parsed.hostname || parsed.pathname !== '/' || parsed.search !== '' || parsed.hash !== '') {
+		throw new Error(`${TAG} ${label} 的 "webToolsProxy" 必须是 host:port 或 user:pass@host:port 形式（不含路径）: ${value}`);
+	}
+	const port = Number(parsed.port);
+	if (parsed.port === '' || !(port >= 1 && port <= 65535)) {
+		throw new Error(`${TAG} ${label} 的 "webToolsProxy" 端口缺失或超出范围（1-65535）: ${value}`);
 	}
 	return value;
 }
@@ -1017,7 +1024,7 @@ async function apply(ctx, config = {}) {
 					return;
 				}
 				if (body.kind === 'webtools') {
-					// v0.5.0：草稿 host:port 优先——未保存也能立即测试（仅支持 http:// 代理）
+					// v0.5.1：草稿地址优先（host:port 或 user:pass@host:port）——未保存也能立即测试（仅支持 http:// 代理）
 					let message = null;
 					let url = null;
 					const host = typeof body.url === 'string' && body.url.trim() !== ''

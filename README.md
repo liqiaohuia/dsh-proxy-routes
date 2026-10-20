@@ -42,7 +42,7 @@ dsh plugin --profile web add dsh-proxy-routes
 1. **代理池**：给每个代理起名并填地址，例如 `main` = `socks5://127.0.0.1:50939`。填完直接点「测试」确认可达——测试的是输入框里**当前的草稿值**，不用先保存
 2. **按提供商（账号）分流**：列表自动来自 DSH「模型」页配置的 LLM 账号（claude1、nvidia-01…），每行下拉选择 直连 / 池中某个代理；选「规则」（默认）表示不单独设置、按默认走向走
 3. **默认走向**：未单独设置的账号（以及一切非 LLM 流量）走哪条路——建议 `direct`，让新流量默认不绕代理。其下方「**直连的行为**」默认**绝对直连**：被选为直连的请求由本插件强制直连，无视 DSH 全局代理与其他代理设置；想交回 DSH 原生策略可切换为「遵循全局代理」
-4. **内置联网工具代理**（可选，v0.5.0）：想让 `web_fetch` 抓境外网页、MCP 子进程等未认领流量也走代理时勾选，填一个 **http:// 代理的 `host:port`**（如 `127.0.0.1:10000`，`http://` 前缀已固定）——保存即生效、无需重启，关闭或卸载插件时自动还原 DSH 原有全局设置
+4. **内置联网工具代理**（可选，v0.5.0）：想让 `web_fetch` 抓境外网页、MCP 子进程等未认领流量也走代理时勾选，填一个 **http:// 代理的 `host:port`**（如 `127.0.0.1:10000`，`http://` 前缀已固定；v0.5.1 起支持认证，写 `user:pass@host:port`，密码特殊字符须 URL 编码如 `@` → `%40`）——保存即生效、无需重启，关闭或卸载插件时自动还原 DSH 原有全局设置
 5. 点「**保存**」，立即生效
 
 ### 验证生效
@@ -99,8 +99,8 @@ DSH 发出的每个 LLM 请求都带着该账号的 API 密钥头（`x-api-key` 
 
 DSH 内置的 `web_fetch` 抓取、之后启动的 MCP 子进程、以及一切**未被本插件认领**的流量，默认不经过本插件——它们归官方全局出站策略管。勾选本模块即可在卡片里直接驱动该策略：
 
-- 只支持 **http:// 代理**（官方 dsh-http-proxy 拒收 SOCKS URL），因此地址固定为 `http://` 前缀 + `host:port`（如 `127.0.0.1:10000`），输入框只填 `host:port`
-- **保存即生效，无需重启 DSH**，也完全不需要设置系统环境变量——插件热装官方全局策略；关闭或卸载时自动原样还原，系统原有的 `HTTP(S)_PROXY` 配置不受破坏
+- 只支持 **http:// 代理**（官方 dsh-http-proxy 拒收 SOCKS URL），因此地址固定为 `http://` 前缀 + `host:port`（如 `127.0.0.1:10000`），输入框只填 `host:port`；**v0.5.1 起支持带认证**——填 `user:pass@host:port` 即可，密码中的特殊字符须 URL 编码（`@` → `%40`、`:` → `%3A`）
+- **保存即生效，无需重启 DSH**，也完全不需要设置系统环境变量——插件热装官方全局策略；关闭或卸载时自动原样还原，系统原有的 `HTTP(S)_PROXY` 配置不受破坏。海外环境可直接填商用代理的远程地址（含用户名密码），不必先用 xray 等工具把端口映射到本机
 - 典型场景：模型 API 走国内端点、被本插件认领为绝对直连——飞快；同时 `web_fetch` 抓境外网页走这里配的代理——不被墙。两者互不干扰，这就是「直连的行为」作为底层保证的意义
 - 回环地址（localhost / 127.0.0.1）永远自动豁免，本地流量不会被送进代理
 
@@ -191,7 +191,8 @@ DSH 启动时由官方 dsh-http-proxy 读取这三个环境变量，装一个进
   "providerRoutes": { "claude1": "main", "claude2": "direct" },
   // 直连的语义（v0.5.0）："enforce"=绝对直连（默认，无视 DSH 全局代理）| "passthrough"=不干预、遵循 DSH 全局代理
   "directMode": "enforce",
-  // 内置联网工具代理（v0.5.0）：web_fetch / MCP 子进程 / 未认领流量的 http:// 代理（host:port，不带前缀）
+  // 内置联网工具代理（v0.5.0）：web_fetch / MCP 子进程 / 未认领流量的 http:// 代理
+  // （host:port 或 user:pass@host:port——v0.5.1 起支持认证，密码特殊字符 URL 编码）
   "webToolsEnabled": false,
   "webToolsProxy": "127.0.0.1:10000",
   // 打印每次走代理的请求（默认 true）
@@ -203,6 +204,7 @@ DSH 启动时由官方 dsh-http-proxy 读取这三个环境变量，装一个进
 
 ## 从旧版本升级
 
+- **v0.5.1 起「内置联网工具代理」支持带认证的地址**（`user:pass@host:port`，海外商用代理可直接填）；旧的 `host:port` 写法完全兼容，无需改动
 - **v0.5.0 起「直连」默认为绝对直连**：被本插件认领的直连请求不再回落 DSH 全局代理（v0.4 语义为不干预、会跟随 `HTTP(S)_PROXY`）。如果你设了系统环境变量代理且希望直连请求也走它，把卡片「直连的行为」切换为「遵循全局代理」即可，行为与 v0.4 完全一致
 - **v0.4.1 起按域名分流（`routes`）整体移除**：路由只由「提供商走向 + 默认走向」决定，旧配置里的 `routes` 字段被直接忽略
 - 旧版 `modelRoutes`（`"providerId/modelId"`）读取时自动迁移为按提供商（取前缀）
@@ -232,7 +234,7 @@ DSH 启动时由官方 dsh-http-proxy 读取这三个环境变量，装一个进
 git clone https://github.com/liqiaohuia/dsh-proxy-routes.git
 cd dsh-proxy-routes
 pnpm install          # devDependencies：undici/react/esbuild/typescript
-node test-plugin.mjs  # 47 项测试（网络用例需本机 50939/50018 两个 SOCKS5 代理在运行）
+node test-plugin.mjs  # 52 项测试（网络用例需本机 50939/50018 两个 SOCKS5 代理在运行）
 ```
 
 - **开发机用 link 安装**：`dsh plugin add <本目录>` 放的是指向本目录的 `link:` 依赖——改 host 侧代码（`index.mjs` / `transport.mjs` / `catalog.mjs`）后重启即生效；改客户端（`src/client/`）后要 `pnpm build` 重建 `lib/client.js` 再重启

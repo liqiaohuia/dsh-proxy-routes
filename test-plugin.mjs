@@ -7,6 +7,8 @@
 // v0.5.0：绝对直连（enforce 绕过原始 fetch）与 passthrough（回落原始 fetch）、
 // directMode / webTools 配置字段（volatile + describe 载荷）、
 // /test webtools（http-only 草稿探测）。
+// v0.5.1：联网工具代理支持认证格式——/test webtools 草稿（user:pass@host:port
+// 可测、端口越界拒绝）+ 配置层坏格式拒绝（校验失败日志 + 不触发热装 + 降级直落）。
 //
 // 运行：node test-plugin.mjs
 // 前置：本机 50939 / 50018 两个 SOCKS5 代理在监听（xray）；未监听时网络用例报 FAIL。
@@ -173,6 +175,7 @@ try {
 
 	const webRoutes = [];
 	let directModeSetting = 'enforce'; // v0.5.0：阶段 A 默认（绝对直连）；阶段 B 翻为 passthrough
+	let webToolsSetting = null; // v0.5.1：阶段 C 注入 webTools 字段（坏格式 → 配置层校验拒绝）
 	const settingsRows = () => ([
 		{
 			ns: 'proxy-routes',
@@ -181,6 +184,7 @@ try {
 				providerRoutes: { claude1: 'main', claude2: 'direct' },
 				default: 'direct',
 				directMode: directModeSetting,
+				...(webToolsSetting ?? {}), // v0.5.1：webToolsEnabled / webToolsProxy
 				logRequests: true,
 			},
 		},
@@ -291,6 +295,17 @@ try {
 			await testRoute.handler(reqOf({ kind: 'webtools', name: '(webtools)', url: '127.0.0.1:1' }), rWt2);
 			const wt2 = JSON.parse(rWt2.body);
 			check('/test webtools：无代理监听的端口探测不通（host:port 草稿可测）', wt2.ok === false);
+			// v0.5.1：认证格式（user:pass@host:port）
+			const rWt3 = resOf();
+			await testRoute.handler(reqOf({ kind: 'webtools', name: '(webtools)', url: 'user:pass@127.0.0.1:1' }), rWt3);
+			const wt3 = JSON.parse(rWt3.body);
+			check('/test webtools：user:pass@host:port 认证格式放行进入连通性探测（非格式报错）',
+				wt3.ok === false && !String(wt3.message).includes('必须是') && !String(wt3.message).includes('不支持协议前缀') && !String(wt3.message).includes('不是合法'));
+			const rWt4 = resOf();
+			await testRoute.handler(reqOf({ kind: 'webtools', name: '(webtools)', url: 'user:pass@127.0.0.1:99999' }), rWt4);
+			const wt4 = JSON.parse(rWt4.body);
+			check('/test webtools：认证格式端口越界（99999）被 URL 解析拒绝',
+				wt4.ok === false && String(wt4.message).includes('不是合法'));
 		} else {
 			check('bridge /test 路由存在', false);
 		}
@@ -309,6 +324,24 @@ try {
 	check('directMode=passthrough：直连请求回落原始 fetch（不干预全局策略）', originalFetchCalls === before + 1);
 	try { await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY1, 'content-type': 'application/json' }, body: '{}' }); } catch { /* ignore */ }
 	check('directMode=passthrough：代理请求仍走插件 dispatcher（不经过原始 fetch）', originalFetchCalls === before + 1);
+
+	/* —— v0.5.1 阶段 C：webTools 认证格式——配置层校验。带 http:// 前缀的认证
+	   地址必须被拒（前缀由插件补齐）、不触发热装，且保留上一份配置——settings
+	   模式 apply 先加载 schema 派生默认（直连 + enforce），「条目配置(设置)」
+	   校验失败时保留它，插件继续以默认配置接管而非裸奔。—— */
+	webToolsSetting = { webToolsEnabled: true, webToolsProxy: 'http://user:pass@127.0.0.1:10000' };
+	const logsBeforeC = logs.length;
+	for (const d of dispose2.splice(0)) { try { d?.(); } catch { /* ignore */ } }
+	await apply(ctx2, {});
+	await delay(300);
+	const logsC = logs.slice(logsBeforeC);
+	check('v0.5.1 webTools 校验：http:// 前缀被拒（配置校验失败日志指向 webToolsProxy）',
+		logsC.some((l) => l.includes('配置校验失败') && l.includes('webToolsProxy')));
+	check('v0.5.1 webTools 校验：坏格式不触发热装（无「内置联网工具代理已生效」日志）',
+		!logsC.some((l) => l.includes('内置联网工具代理已生效')));
+	const before3 = originalFetchCalls;
+	try { await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY2, 'content-type': 'application/json' }, body: '{}' }); } catch { /* ignore */ }
+	check('v0.5.1 webTools 校验：坏格式保留上一份配置（默认直连 enforce 仍接管，不落原始 fetch）', originalFetchCalls === before3);
 
 	for (const d of dispose2.splice(0)) { try { d?.(); } catch { /* ignore */ } }
 	delete process.env.DPR_TEST_K1;

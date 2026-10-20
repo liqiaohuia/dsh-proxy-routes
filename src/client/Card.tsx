@@ -292,11 +292,19 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 		if (readOnly) return
 		setSaving(true)
 		setSaveMsg(null)
-		// v0.5.0：联网工具代理格式校验（host:port，不带协议前缀）
+		// v0.5.1：联网工具代理格式校验（host:port 或 user:pass@host:port），与服务端 validateWebToolsHost 同规则
 		const webToolsHost = (draft.webToolsProxy ?? '').trim()
-		const webToolsPort = Number(webToolsHost.match(/:(\d{1,5})$/)?.[1] ?? 0)
-		if (draft.webToolsEnabled === true
-			&& (!(/^\[([^\]]+)\]:(\d{1,5})$/.test(webToolsHost) || /^[^:/[\]]+:(\d{1,5})$/.test(webToolsHost)) || webToolsPort < 1 || webToolsPort > 65535)) {
+		let webToolsValid = false
+		if (webToolsHost !== '' && !webToolsHost.includes('://')) {
+			try {
+				const parsed = new URL(`http://${webToolsHost}`)
+				webToolsValid = parsed.hostname !== '' && parsed.pathname === '/' && parsed.search === '' && parsed.hash === ''
+					&& parsed.port !== '' && Number(parsed.port) >= 1 && Number(parsed.port) <= 65535
+			} catch {
+				webToolsValid = false
+			}
+		}
+		if (draft.webToolsEnabled === true && !webToolsValid) {
 			setSaving(false)
 			setSaveMsg(t('webToolsBadFormat'))
 			return
@@ -434,7 +442,7 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 							...(readOnly ? S.disabled : {}),
 						}}>http://</span>
 						<input style={{ ...S.input, borderRadius: '0 6px 6px 0', ...(readOnly ? S.disabled : {}) }} value={draft.webToolsProxy ?? ''} disabled={readOnly}
-							onChange={(e) => patch({ webToolsProxy: e.target.value })} placeholder="127.0.0.1:10000" aria-label={t('webToolsHost')} />
+							onChange={(e) => patch({ webToolsProxy: e.target.value })} placeholder={t('webToolsPlaceholder')} aria-label={t('webToolsHost')} />
 						<button style={S.button} onClick={() => void runTest('webtools', '(webtools)')}>{t('test')}</button>
 						{testBadge(tests['(webtools)'])}
 					</div>
