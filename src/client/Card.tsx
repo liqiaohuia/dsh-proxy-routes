@@ -39,6 +39,8 @@ export interface DescribeValue {
 	probeUrl: string
 	rows: ModelRow[]
 	providers: ProviderRow[]
+	/** v0.6.0：同密钥且无法按主机名区分的账号组（仅 id）。 */
+	keyConflicts?: string[][]
 }
 
 export interface TestOutcome {
@@ -399,6 +401,12 @@ function ProxyRoutesEditor({ t }: { t: Translate }): ReactNode {
 			<div style={S.section}>
 				<span style={S.sectionTitle}>{t('providerRoutes')}</span>
 				<span style={S.hint}>{t('providerHint')}</span>
+				{(draft.keyConflicts?.length ?? 0) > 0 && (
+					<span style={S.hint}>
+						{t('keyConflictWarning')}
+						{(draft.keyConflicts ?? []).map((group) => group.join(' ↔ ')).join('；')}
+					</span>
+				)}
 				{draft.providers.length === 0 && <span style={S.hint}>{t('emptyProviders')}</span>}
 				{draft.providers.map((provider) => (
 					<div key={provider.id} style={S.row}>

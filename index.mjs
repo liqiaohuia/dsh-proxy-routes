@@ -397,6 +397,12 @@ async function apply(ctx, config = {}) {
 		providerDecisions: new Map(),
 		/** API 密钥 → 提供商 id（内存使用，绝不写日志）。 */
 		keyRoutes: new Map(),
+		/** API 密钥 → (baseURL 主机名 → 提供商 id)——v0.6.0 组合识别：同密钥
+		 *  多账号按请求主机名细分（内存使用，绝不写日志）。 */
+		keyHostRoutes: new Map(),
+		/** 同密钥且同主机名（或无主机名）的提供商冲突组，[[先者, 后者, ...]]——
+		 *  仅含 id，绝不含密钥，给卡片警示用。 */
+		keyConflicts: [],
 		/** 提供商 id → baseURL host（describe 得来，卡片展示用）。 */
 		providerHosts: new Map(),
 		/** 最近一次密钥映射的签名（条数+提供商集合）——未变化时不重复打日志。 */
@@ -440,10 +446,13 @@ async function apply(ctx, config = {}) {
 	};
 	/**
 	 * 提取请求携带的 API 密钥（llm-pi-ai 的出站协议：anthropic-messages 用
-	 * x-api-key，其余用 authorization: Bearer）。仅内存匹配，绝不落日志。
+	 * x-api-key，google-generative-ai 用 x-goog-api-key，其余用
+	 * authorization: Bearer）。仅内存匹配，绝不落日志。
 	 */
 	const extractApiKey = (input, init) => {
 		for (const headers of [init?.headers, input?.headers]) {
+			const goog = headerValue(headers, 'x-goog-api-key');
+			if (goog !== undefined) return goog;
 			const direct = headerValue(headers, 'x-api-key');
 			if (direct !== undefined) return direct;
 			const auth = headerValue(headers, 'authorization');
@@ -453,12 +462,22 @@ async function apply(ctx, config = {}) {
 	};
 	/**
 	 * 一次请求的完整决策：先按密钥识别提供商（同域名多账号可各走各的），
-	 * 未命中再落默认走向。
+	 * 未命中再落默认走向。v0.6.0 起密钥识别分两层——先试（密钥 + 请求主机名）
+	 * 组合表（不同平台/域名复用同一密钥也能各走各的），未命中再落裸密钥表
+	 * （同密钥先配置者生效）。
 	 */
 	const decideForRequest = (url, input, init) => {
 		if (state.keyRoutes.size > 0) {
 			const key = extractApiKey(input, init);
 			if (key !== undefined) {
+				if (url) {
+					const byHost = state.keyHostRoutes.get(key);
+					const pidByHost = byHost !== undefined ? byHost.get(url.hostname.toLowerCase()) : undefined;
+					if (pidByHost !== undefined) {
+						const providerDecision = state.providerDecisions.get(pidByHost);
+						if (providerDecision !== undefined) return { decision: providerDecision, provider: pidByHost };
+					}
+				}
 				const pid = state.keyRoutes.get(key);
 				if (pid !== undefined) {
 					const providerDecision = state.providerDecisions.get(pid);
@@ -690,6 +709,8 @@ async function apply(ctx, config = {}) {
 		}
 		const next = new Map();
 		const hosts = new Map();
+		const keyHost = new Map();
+		const conflicts = new Map();
 		for (const row of rows ?? []) {
 			const providers = row?.value?.providers;
 			if (providers === null || typeof providers !== 'object' || Array.isArray(providers)) continue;
@@ -715,23 +736,49 @@ async function apply(ctx, config = {}) {
 					} catch { /* 该提供商暂无凭据 */ }
 				}
 				if (key === undefined) continue;
+				const host = hosts.get(pid);
 				const existing = next.get(key);
 				if (existing !== undefined) {
-					if (existing !== pid) log.warn(`${TAG} 提供商 "${pid}" 与 "${existing}" 的密钥相同，按先者生效`);
+					// v0.6.0：裸密钥已被先者认领。只有「无法按主机名区分」才真的冲突——
+					// 后者没有主机名（无处挂组合表），或其主机名已被同密钥的先者占用。
+					// 主机名不同的账号已在组合表各就各位，不算冲突。
+					const byHost = keyHost.get(key);
+					const hostedOwner = host !== undefined && byHost !== undefined ? byHost.get(host) : undefined;
+					if (host === undefined || hostedOwner !== undefined) {
+						const first = hostedOwner !== undefined ? hostedOwner : existing;
+						log.warn(`${TAG} 提供商 "${pid}" 与 "${first}" 密钥相同且无法按主机名区分，按先者生效`);
+						let group = conflicts.get(first);
+						if (group === undefined) { group = [first]; conflicts.set(first, group); }
+						if (!group.includes(pid)) group.push(pid);
+						continue;
+					}
+					// 主机名不同：仅入组合表，不认领裸密钥。
+					let ownHost = byHost;
+					if (ownHost === undefined) { ownHost = new Map(); keyHost.set(key, ownHost); }
+					ownHost.set(host, pid);
 					continue;
 				}
+				// 该密钥的先者：认领裸密钥；有主机名则同时入组合表。
 				next.set(key, pid);
+				if (host !== undefined) {
+					let byHost = keyHost.get(key);
+					if (byHost === undefined) { byHost = new Map(); keyHost.set(key, byHost); }
+					byHost.set(host, pid);
+				}
 			}
 		}
 		state.keyRoutes = next;
+		state.keyHostRoutes = keyHost;
+		state.keyConflicts = [...conflicts.values()].map((group) => [...group]);
 		state.providerHosts = hosts;
 		// 仅在提供商集合真的变化时打日志——DSH 每条消息都可能触发无关的
 		// settings 写入，重复重建若每次都打日志会刷屏。
 		const names = [...new Set(next.values())].sort();
-		const signature = `${next.size}|${names.join(',')}`;
+		const signature = `${next.size}|${names.join(',')}|C${conflicts.size}`;
 		if (signature !== state.keyRoutesSignature) {
 			state.keyRoutesSignature = signature;
-			log.info(`${TAG} 密钥→提供商映射已建立：${next.size} 条（提供商 ${names.join(', ') || '无'}）`);
+			const conflictNote = conflicts.size > 0 ? `，${conflicts.size} 组同密钥同主机名（详见卡片警示）` : '';
+			log.info(`${TAG} 密钥→提供商映射已建立：${next.size} 条（提供商 ${names.join(', ') || '无'}${conflictNote}）`);
 		}
 		return true;
 	};
@@ -895,6 +942,12 @@ async function apply(ctx, config = {}) {
 			for (const pid of state.keyRoutes.values()) {
 				ensureRow(pid).hasKey = true;
 			}
+			// v0.6.0：组合表里的提供商（同密钥不同主机名的账号）同样有密钥。
+			for (const byHost of state.keyHostRoutes ?? []) {
+				for (const pid of byHost[1].values()) {
+					ensureRow(pid).hasKey = true;
+				}
+			}
 			return [...byId.values()];
 		};
 		/** 当前生效配置的摘要（卡片状态区：文件模式提示 + 提供商清单）。 */
@@ -914,6 +967,9 @@ async function apply(ctx, config = {}) {
 				probeUrl: state.cfg?.probeUrl ?? 'https://www.gstatic.com/generate_204',
 				rows: state.rows.map((row) => ({ ...row })),
 				providers: providerRows(),
+				// v0.6.0：同密钥且无法按主机名区分的账号组（仅 id，绝不含密钥）——
+				// 卡片据此显示警示。
+				keyConflicts: (state.keyConflicts ?? []).map((group) => [...group]),
 			},
 		});
 		/** 0.1.7+ 的 settings 从插件 Config schema 派生，没有 register()/mutate

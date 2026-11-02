@@ -9,6 +9,8 @@
 // /test webtools（http-only 草稿探测）。
 // v0.5.1：联网工具代理支持认证格式——/test webtools 草稿（user:pass@host:port
 // 可测、端口越界拒绝）+ 配置层坏格式拒绝（校验失败日志 + 不触发热装 + 降级直落）。
+// v0.6.0：多协议密钥识别（x-goog-api-key）+ 组合识别（密钥 × 主机名）——同密钥
+// 跨主机名各走各的、同密钥同主机名先者生效并归组警示（describe keyConflicts）。
 //
 // 运行：node test-plugin.mjs
 // 前置：本机 50939 / 50018 两个 SOCKS5 代理在监听（xray）；未监听时网络用例报 FAIL。
@@ -181,7 +183,7 @@ try {
 			ns: 'proxy-routes',
 			value: {
 				proxies: { main: 'socks5://127.0.0.1:50939' },
-				providerRoutes: { claude1: 'main', claude2: 'direct' },
+				providerRoutes: { claude1: 'main', claude2: 'direct', claude4: 'main', claude5: 'main' },
 				default: 'direct',
 				directMode: directModeSetting,
 				...(webToolsSetting ?? {}), // v0.5.1：webToolsEnabled / webToolsProxy
@@ -195,6 +197,10 @@ try {
 					claude1: { apiKeyEnv: 'DPR_TEST_K1', baseURL: 'https://api.anthropic.com', displayName: 'Claude #1', models: [{ id: 'claude-x', name: 'Claude X' }] },
 					claude2: { apiKeyEnv: 'DPR_TEST_K2', baseURL: 'https://api.anthropic.com', displayName: 'Claude #2', models: [{ id: 'claude-y', name: 'Claude Y' }] },
 					claude3: { baseURL: 'https://open.bigmodel.cn/api/paas/v4', displayName: 'Claude #3', models: [{ id: 'claude-z', name: 'Claude Z' }] },
+					// v0.6.0：claude4 与 claude1 同密钥、不同主机名（组合识别可区分）；
+					// claude5 与 claude1 同密钥同主机名（真冲突——先者生效 + 卡片警示）
+					claude4: { apiKeyEnv: 'DPR_TEST_K1', baseURL: 'https://gemini.invalid', displayName: 'Claude #4 (google-ish)', models: [{ id: 'gemini-x', name: 'Gemini X' }] },
+					claude5: { apiKeyEnv: 'DPR_TEST_K1', baseURL: 'https://api.anthropic.com', displayName: 'Claude #5', models: [{ id: 'claude-w', name: 'Claude W' }] },
 				},
 			},
 		},
@@ -231,15 +237,29 @@ try {
 	try { r1 = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY1, 'content-type': 'application/json' }, body: '{}' }); }
 	catch (e) { console.log('  claude1: ' + (e.cause?.message ?? e.message)); }
 	check('同域双账号：claude1 经 main(50939) -> 401', r1 !== null && r1.status === 401);
+	let claude2DirectError = null;
 	try { r2 = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY2, 'content-type': 'application/json' }, body: '{}' }); }
-	catch (e) { console.log('  claude2: ' + (e.cause?.message ?? e.message)); }
-	check('同域双账号：claude2 显式直连 -> 403（同一 URL 仅密钥不同）', r2 !== null && r2.status === 403);
+	catch (e) { claude2DirectError = e; console.log('  claude2: ' + (e.cause?.message ?? e.message)); }
+	check('同域双账号：claude2 显式直连 → 403（直连不可达亦可；绝不能是代理的 401，也绝无 claude2=> 路由日志）',
+		(r2 !== null ? r2.status === 403 : claude2DirectError !== null) && !logs.some((l) => l.includes('claude2=>')));
 	try { r3 = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }); }
 	catch (e) { console.log('  nokey: ' + (e.cause?.message ?? e.message)); }
 	check('无密钥请求：未命中提供商 → 默认直连 403', r3 !== null && r3.status === 403);
 	check('路由日志：claude1=>main（提供商名入日志）', logs.some((l) => l.includes('claude1=>main:socks5://127.0.0.1:50939')));
 	check('安全回归：密钥值绝不落日志', !logs.some((l) => l.includes(KEY1) || l.includes(KEY2)));
 	check('v0.5.0 绝对直连（默认 enforce）：direct 与代理请求全部绕过原始 fetch', originalFetchCalls === 0);
+
+	// v0.6.0：组合识别——同密钥跨主机名各走各的；x-goog-api-key（Google 协议）参与识别
+	let r4 = null;
+	try { r4 = await fetch('https://gemini.invalid/v1beta/models/gemini-x:generateContent', { method: 'POST', headers: { 'x-goog-api-key': KEY1, 'x-api-key': KEY2, 'content-type': 'application/json' }, body: '{}' }); }
+	catch (e) { console.log('  claude4: ' + (e.cause?.message ?? e.message)); }
+	check('v0.6.0 组合识别：同密钥不同主机名 → gemini.invalid 命中 claude4（x-goog-api-key 优先于 x-api-key）',
+		logs.some((l) => l.includes('gemini.invalid') && l.includes('claude4=>main')));
+	check('v0.6.0 冲突语义：同密钥同主机名的 claude5 永不可达（先者 claude1 生效）', !logs.some((l) => l.includes('claude5=>')));
+	try { await fetch('https://fallback.invalid/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY1, 'content-type': 'application/json' }, body: '{}' }); }
+	catch { /* ignore */ }
+	check('v0.6.0 裸密钥兜底：未知主机名回落先者 claude1', logs.some((l) => l.includes('fallback.invalid') && l.includes('claude1=>main')));
+	check('v0.6.0 密钥仍绝不落日志', !logs.some((l) => l.includes(KEY1) || l.includes(KEY2)));
 
 	// bridge describe：providers 行（hasKey + host），且不含密钥本体
 	const describeRoute = webRoutes.find((r) => r.path.endsWith('/describe'));
@@ -253,17 +273,21 @@ try {
 		try { described = JSON.parse(resMock.body); } catch { /* ignore */ }
 		const providers = described?.value?.providers ?? [];
 		const byId = Object.fromEntries(providers.map((p) => [p.id, p]));
-		check('bridge describe：providers 含 claude1/claude2/claude3（hasKey + host 来自 baseURL）',
-			providers.length === 3
+		check('bridge describe：providers 含 claude1..claude5（hasKey + host 来自 baseURL；claude4 经组合表 hasKey）',
+			providers.length === 5
 			&& byId.claude1?.hasKey === true && byId.claude1?.host === 'api.anthropic.com'
 			&& byId.claude2?.hasKey === true && byId.claude2?.host === 'api.anthropic.com'
-			&& byId.claude3?.hasKey === false && byId.claude3?.host === 'open.bigmodel.cn');
+			&& byId.claude3?.hasKey === false && byId.claude3?.host === 'open.bigmodel.cn'
+			&& byId.claude4?.hasKey === true && byId.claude4?.host === 'gemini.invalid'
+			&& byId.claude5?.hasKey === false && byId.claude5?.host === 'api.anthropic.com');
 		check('bridge describe：不含密钥本体', !resMock.body.includes(KEY1) && !resMock.body.includes(KEY2));
 		check('bridge describe：mode 为 settings（默认姿态）', described?.value?.mode === 'settings');
 		check('bridge describe：v0.5.0 新字段（directMode=enforce / webTools 关闭+默认地址）',
 			described?.value?.directMode === 'enforce'
 			&& described?.value?.webToolsEnabled === false
 			&& described?.value?.webToolsProxy === '127.0.0.1:10000');
+		check('bridge describe：v0.6.0 keyConflicts——同密钥同主机名归组（claude4 跨主机名不算冲突）',
+			JSON.stringify(described?.value?.keyConflicts) === JSON.stringify([['claude1', 'claude5']]));
 
 		// /test kind=proxy 带草稿地址：未保存的新代理也能立即测试（v0.4.1）
 		const testRoute = webRoutes.find((r) => r.path.endsWith('/test'));
