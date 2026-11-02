@@ -403,6 +403,10 @@ async function apply(ctx, config = {}) {
 		/** 同密钥且同主机名（或无主机名）的提供商冲突组，[[先者, 后者, ...]]——
 		 *  仅含 id，绝不含密钥，给卡片警示用。 */
 		keyConflicts: [],
+		/** API 密钥 → 共用该密钥的全部提供商（v0.6.1 模型归因的作用域）。 */
+		keyGroups: new Map(),
+		/** 模型 id → 提供商 id 集合（目录聚合；v0.6.1 模型归因用）。 */
+		modelOwners: new Map(),
 		/** 提供商 id → baseURL host（describe 得来，卡片展示用）。 */
 		providerHosts: new Map(),
 		/** 最近一次密钥映射的签名（条数+提供商集合）——未变化时不重复打日志。 */
@@ -461,28 +465,83 @@ async function apply(ctx, config = {}) {
 		return undefined;
 	};
 	/**
-	 * 一次请求的完整决策：先按密钥识别提供商（同域名多账号可各走各的），
-	 * 未命中再落默认走向。v0.6.0 起密钥识别分两层——先试（密钥 + 请求主机名）
-	 * 组合表（不同平台/域名复用同一密钥也能各走各的），未命中再落裸密钥表
-	 * （同密钥先配置者生效）。
+	 * 提取请求的模型 id（v0.6.1 模型归因的依据）：google-generative-ai 在路径里
+	 * （/v1beta/models/{model}:generateContent），anthropic-messages 与 openai 系
+	 * 在 JSON 体开头的 "model" 字段（两种协议都把 model 放在最前，体可能极大，
+	 * 只扫前 4KB，不做整包解析；Request 流体无法无副作用读取，跳过）。
+	 * 仅内存匹配，绝不落日志。
+	 */
+	const extractModelId = (url, input, init) => {
+		if (url) {
+			const byPath = /\/models\/([^/:?#]+)/.exec(url.pathname);
+			if (byPath) return decodeURIComponent(byPath[1]);
+		}
+		for (const body of [init?.body, input?.body]) {
+			if (typeof body !== 'string' || body.length < 2) continue;
+			const head = body.length > 4096 ? body.slice(0, 4096) : body;
+			const byBody = /"model"\s*:\s*"([^"]+)"/.exec(head);
+			if (byBody) return byBody[1];
+			break;
+		}
+		return undefined;
+	};
+	/**
+	 * v0.6.1 模型归因：把模型 id 映射到提供商。scope 传同密钥组（在组内按主机名
+	 * 挑唯一归属），传 null 表示无密钥场景（要求提供商主机名与请求主机名一致且
+	 * 模型归属唯一）。候选多于一个（真歧义）或为零时放弃归因，交回调用方。
+	 */
+	const attributeByModel = (url, input, init, scope) => {
+		if (!url) return undefined;
+		const mid = extractModelId(url, input, init);
+		if (mid === undefined) return undefined;
+		const owners = state.modelOwners.get(mid);
+		if (owners === undefined) return undefined;
+		const hostname = url.hostname.toLowerCase();
+		let candidate;
+		for (const pid of owners) {
+			if (scope !== null && scope !== undefined && !scope.has(pid)) continue;
+			if (state.providerHosts.get(pid) !== hostname) continue;
+			if (candidate !== undefined) return undefined;
+			candidate = pid;
+		}
+		return candidate;
+	};
+	/**
+	 * 一次请求的完整决策（v0.6.1 三层）：
+	 * ① 密钥识别——先试（密钥 + 请求主机名）组合表（不同平台/域名复用同一密钥
+	 *    各走各的），未命中落裸密钥表（同密钥先配置者生效）；
+	 * ② 模型归因——密钥命中但该密钥被多个账号共用时，按请求中的模型 id 在组内
+	 *    挑唯一归属（同平台同密钥的网关/多模型分账场景）；
+	 * ③ 无密钥可提取时——请求主机名 + 模型 id 双匹配且归属唯一才路由（捕获
+	 *    密钥不走在头里的协议），否则落默认走向。
 	 */
 	const decideForRequest = (url, input, init) => {
 		if (state.keyRoutes.size > 0) {
 			const key = extractApiKey(input, init);
 			if (key !== undefined) {
+				let hit;
 				if (url) {
 					const byHost = state.keyHostRoutes.get(key);
 					const pidByHost = byHost !== undefined ? byHost.get(url.hostname.toLowerCase()) : undefined;
-					if (pidByHost !== undefined) {
-						const providerDecision = state.providerDecisions.get(pidByHost);
-						if (providerDecision !== undefined) return { decision: providerDecision, provider: pidByHost };
-					}
+					if (pidByHost !== undefined) hit = pidByHost;
 				}
-				const pid = state.keyRoutes.get(key);
-				if (pid !== undefined) {
+				if (hit === undefined) hit = state.keyRoutes.get(key);
+				if (hit !== undefined) {
+					const group = state.keyGroups.get(key);
+					const attributed = group !== undefined && group.size > 1
+						? attributeByModel(url, input, init, group)
+						: undefined;
+					const pid = attributed !== undefined ? attributed : hit;
 					const providerDecision = state.providerDecisions.get(pid);
 					if (providerDecision !== undefined) return { decision: providerDecision, provider: pid };
 				}
+			}
+		}
+		if (url) {
+			const attributed = attributeByModel(url, input, init, null);
+			if (attributed !== undefined) {
+				const providerDecision = state.providerDecisions.get(attributed);
+				if (providerDecision !== undefined) return { decision: providerDecision, provider: attributed };
 			}
 		}
 		return { decision: state.decide(), provider: null };
@@ -684,7 +743,25 @@ async function apply(ctx, config = {}) {
 		try {
 			state.rows = listModels(state.seam);
 		} catch { /* 保持旧目录 */ }
+		rebuildModelOwners();
 		if (rawSnapshotForRecompile) recompile(announce);
+	};
+
+	/**
+	 * v0.6.1：重建「模型 id → 提供商 id 集合」——模型归因的依据。目录里同一
+	 * 模型被多个账号声明时集合含多个 id，归因在候选唯一时才生效。
+	 */
+	const rebuildModelOwners = () => {
+		const owners = new Map();
+		for (const row of state.rows ?? []) {
+			const mid = row?.modelId;
+			const pid = row?.providerId;
+			if (typeof mid !== 'string' || mid === '' || typeof pid !== 'string' || pid === '') continue;
+			let set = owners.get(mid);
+			if (set === undefined) { set = new Set(); owners.set(mid, set); }
+			set.add(pid);
+		}
+		state.modelOwners = owners;
 	};
 
 	/**
@@ -711,6 +788,7 @@ async function apply(ctx, config = {}) {
 		const hosts = new Map();
 		const keyHost = new Map();
 		const conflicts = new Map();
+		const keyGroups = new Map();
 		for (const row of rows ?? []) {
 			const providers = row?.value?.providers;
 			if (providers === null || typeof providers !== 'object' || Array.isArray(providers)) continue;
@@ -736,6 +814,11 @@ async function apply(ctx, config = {}) {
 					} catch { /* 该提供商暂无凭据 */ }
 				}
 				if (key === undefined) continue;
+				// v0.6.1：同密钥组——所有共用该密钥的提供商（含主机名可区分者），
+				// 模型归因的作用域。
+				let group = keyGroups.get(key);
+				if (group === undefined) { group = new Set(); keyGroups.set(key, group); }
+				group.add(pid);
 				const host = hosts.get(pid);
 				const existing = next.get(key);
 				if (existing !== undefined) {
@@ -746,7 +829,7 @@ async function apply(ctx, config = {}) {
 					const hostedOwner = host !== undefined && byHost !== undefined ? byHost.get(host) : undefined;
 					if (host === undefined || hostedOwner !== undefined) {
 						const first = hostedOwner !== undefined ? hostedOwner : existing;
-						log.warn(`${TAG} 提供商 "${pid}" 与 "${first}" 密钥相同且无法按主机名区分，按先者生效`);
+						log.warn(`${TAG} 提供商 "${pid}" 与 "${first}" 密钥与主机名相同（模型名可区分时按模型归因），默认按先者生效`);
 						let group = conflicts.get(first);
 						if (group === undefined) { group = [first]; conflicts.set(first, group); }
 						if (!group.includes(pid)) group.push(pid);
@@ -770,6 +853,8 @@ async function apply(ctx, config = {}) {
 		state.keyRoutes = next;
 		state.keyHostRoutes = keyHost;
 		state.keyConflicts = [...conflicts.values()].map((group) => [...group]);
+		state.keyGroups = keyGroups;
+		rebuildModelOwners();
 		state.providerHosts = hosts;
 		// 仅在提供商集合真的变化时打日志——DSH 每条消息都可能触发无关的
 		// settings 写入，重复重建若每次都打日志会刷屏。

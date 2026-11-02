@@ -11,6 +11,8 @@
 // 可测、端口越界拒绝）+ 配置层坏格式拒绝（校验失败日志 + 不触发热装 + 降级直落）。
 // v0.6.0：多协议密钥识别（x-goog-api-key）+ 组合识别（密钥 × 主机名）——同密钥
 // 跨主机名各走各的、同密钥同主机名先者生效并归组警示（describe keyConflicts）。
+// v0.6.1：模型归因第三层——同密钥同主机名按请求中的 model 字段细分（网关/
+// 多模型分账场景）；无密钥时主机名 + 模型唯一归属也可路由（捕获非标准协议）。
 //
 // 运行：node test-plugin.mjs
 // 前置：本机 50939 / 50018 两个 SOCKS5 代理在监听（xray）；未监听时网络用例报 FAIL。
@@ -255,10 +257,20 @@ try {
 	catch (e) { console.log('  claude4: ' + (e.cause?.message ?? e.message)); }
 	check('v0.6.0 组合识别：同密钥不同主机名 → gemini.invalid 命中 claude4（x-goog-api-key 优先于 x-api-key）',
 		logs.some((l) => l.includes('gemini.invalid') && l.includes('claude4=>main')));
-	check('v0.6.0 冲突语义：同密钥同主机名的 claude5 永不可达（先者 claude1 生效）', !logs.some((l) => l.includes('claude5=>')));
+	try { await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY1, 'content-type': 'application/json' }, body: '{}' }); }
+	catch { /* ignore */ }
+	check('v0.6.1 同密钥同主机名、体中无模型 → 先者 claude1（claude5 不越权）', !logs.some((l) => l.includes('claude5=>')));
+	try { await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY1, 'content-type': 'application/json' }, body: '{"model":"claude-w"}' }); }
+	catch { /* ignore */ }
+	check('v0.6.1 模型归因：同密钥同主机名按体中 model 细分 → claude-w 命中 claude5', logs.some((l) => l.includes('claude5=>main')));
 	try { await fetch('https://fallback.invalid/v1/messages', { method: 'POST', headers: { 'x-api-key': KEY1, 'content-type': 'application/json' }, body: '{}' }); }
 	catch { /* ignore */ }
 	check('v0.6.0 裸密钥兜底：未知主机名回落先者 claude1', logs.some((l) => l.includes('fallback.invalid') && l.includes('claude1=>main')));
+	const claude5LogsBefore = logs.filter((l) => l.includes('claude5=>main')).length;
+	try { await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"model":"claude-w"}' }); }
+	catch { /* ignore */ }
+	check('v0.6.1 无密钥兜底：主机名 + 模型唯一归属 → claude5',
+		logs.filter((l) => l.includes('claude5=>main')).length === claude5LogsBefore + 1);
 	check('v0.6.0 密钥仍绝不落日志', !logs.some((l) => l.includes(KEY1) || l.includes(KEY2)));
 
 	// bridge describe：providers 行（hasKey + host），且不含密钥本体
